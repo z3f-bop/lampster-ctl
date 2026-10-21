@@ -32,6 +32,12 @@ Levels are percents. The app's own sliders bottom out at 5, but the lamp accepts
 
 So `0x40` is off, `0xC0` white, `0xA0` colour, `0xE0` both (white with RGB blended in). Writes should preserve bit `0x10`. Levels are stored independently of the mode, so set levels first, then the mode.
 
+## Timing
+
+- A colour write takes effect at once; the lamp does no fading of its own.
+- Write then read back: 58 ms at best, 60 ms median, 121 ms worst (the read is part of that).
+- Alternating pure red and pure blue with `write without response`, a person tracked each switch by eye until they merged into a blur (the step where that happened was not recorded), which is the eye's limit, not necessarily the lamp's. Writes themselves return in 1-2 ms, so the sender is never the bottleneck. Where the lamp itself starts dropping changes is not measured (it would need a high-speed camera).
+
 ## Not found
 
 - Wake-up and off timers: set in the app, they did not fire with the app closed and showed up in no readable register.
