@@ -10,12 +10,15 @@
   lampster.py white WARM COOL  # 0-100 each
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
+  lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
 """
 import asyncio
+import colorsys
 import math
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta
@@ -30,6 +33,8 @@ LEAVING_ROOM = 0x10  # app's "turn off when leaving room" flag, kept across mode
 WHITE_BANK, COLOR_BANK = 0x40, 0x20  # bank bits of the mode byte
 FADE_STEP = 0.25  # seconds between fade writes
 LAT, LON = (float(os.environ.get(k, "nan")) for k in ("LAMPSTER_LAT", "LAMPSTER_LON"))  # degrees, east positive
+STROBE_HZ = 3  # flashes per second, at the photosensitivity guideline limit; never raise this
+STROBE_CHANCE = 0.3  # per 8-beat phrase
 SUN_TICK = 30  # seconds between sun updates at real-time speed
 # (solar elevation deg, R, G, B, warm, cool): red at the horizon, white warming up and cooling by noon, dark by -12
 MOON_LEVELS = (0, 0, 8, 0, 12)  # [R, G, B, warm, cool] a full moon at the zenith adds: faint cool blue-white
@@ -163,8 +168,31 @@ async def sun(c, args):
         await asyncio.sleep(max(0.5, SUN_TICK / speed))
 
 
+async def disco(c, args):
+    """A new vivid colour on every beat; at the end of some 8-beat phrases a short white strobe burst."""
+    beat = 60 / (float(args[0]) if args else 128.0)
+    seconds = float(args[1]) if len(args) > 1 else None
+    keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
+    await c.write_gatt_char(WHITE, bytes([0, 0]), response=True)
+    await c.write_gatt_char(COLOR, bytes([0, 0, 0]), response=False)
+    await c.write_gatt_char(MODE, bytes([MODES["color"] | keep]), response=True)
+    hue, n, t0 = random.random(), 0, time.monotonic()
+    while seconds is None or time.monotonic() - t0 < seconds:
+        if n % 8 == 7 and random.random() < STROBE_CHANCE:
+            for _ in range(4):
+                for level in (100, 0):
+                    await c.write_gatt_char(COLOR, bytes([level] * 3), response=False)
+                    await asyncio.sleep(1 / (2 * STROBE_HZ))
+            n = max(n + 1, math.ceil((time.monotonic() - t0) / beat))
+        else:
+            hue = (hue + random.uniform(0.2, 0.6)) % 1
+            await c.write_gatt_char(COLOR, bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, 1)), response=False)
+            n += 1
+        await asyncio.sleep(max(0, t0 + n * beat - time.monotonic()))
+
+
 async def main(argv):
-    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun"):
+    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
@@ -176,6 +204,8 @@ async def main(argv):
     async with BleakClient(lamp, timeout=20) as c:
         if argv[0] == "fade":
             await fade(c, float(argv[1]), parse_color(argv[2:]))
+        elif argv[0] == "disco":
+            await disco(c, argv[1:])
         elif argv[0] == "sun":
             await sun(c, argv[1:])
         elif argv[0] == "color":

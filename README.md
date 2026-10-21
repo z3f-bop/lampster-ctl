@@ -24,6 +24,12 @@ LAMPSTER_LAT=48.86 LAMPSTER_LON=2.35 ./lampster.py sun
 - Latitude and longitude come from `LAMPSTER_LAT` and `LAMPSTER_LON` (degrees, east positive).
 - The colours are the `SUN_KEYS` and `MOON_LEVELS` tables at the top of the script. Edit to taste.
 
+## Disco mode
+
+`./lampster.py disco [BPM [SECONDS]]` (default 128 BPM, runs until stopped) changes to a new vivid colour on every beat. At the end of some 8-beat phrases it fires a short white strobe burst.
+
+**Photosensitivity:** strobing can trigger seizures in people with photosensitive epilepsy. The burst is held to 3 flashes per second, the common guideline ceiling, and `STROBE_HZ` is a constant you should leave there, especially with guests around. Set `STROBE_CHANCE` to 0 for no strobes at all.
+
 ## Good to know
 
 - The lamp talks to one device at a time. Force-quit the phone app before running anything here, and note that a running `fade` or `sun` holds the connection, so the app cannot connect until you stop it.
