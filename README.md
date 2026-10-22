@@ -40,6 +40,12 @@ LAMPSTER_AUDIO_INPUT=BlackHole ./lampster.py reactive
 
 The beat detector looks at 30-150 Hz energy against its own running average (`BASS_HZ`, `BEAT_RATIO`, `SILENCE` at the top of the script). A kick must reach a share of the track's own recent peak, so the system volume does not matter. When the kick drops out and the highs start climbing (a riser), the whites swell and pulse, capped at 3 flashes per second, then a single full flash lands when the kick returns. The lamp's beat is not every kick: the tempo is estimated from the bass (autocorrelation over the last 10 seconds) and folded into a dance range (`DANCE_BPM`, 82-165), the way people hear it. Music that reads faster is danced at half speed, so extra kicks are skipped; music that reads slower is danced at double speed, so beats are added in between. Every `WHITE_EVERY`-th beat (default 4, one bar) is white and the rest are new colours, each a spike that decays at `DECAY` per update. When the music stops, the lamp fades to 5% over 5 seconds. Laptop speakers have little bass, so with a microphone you may need to lower `SILENCE`. The terminal needs microphone permission the first time. Like disco, it needs `uv` to fetch `numpy` and `sounddevice`.
 
+## Monitor
+
+`./lampster.py monitor [BPM]` opens a live page at `http://localhost:8787` (it never touches the lamp) showing the audio analysis as the track plays: low and high band levels, kicks, the folded tempo, and **novelty**, how far the last bar's spectrum is from the average of the last 8 bars. Steady four-on-the-floor sits near 0.05; a breakdown, a new element or a build lifts it above 0.2, which is where the page shows CHANGE.
+
+Keys in the page: **space** taps tempo (the page shows how far the detector is from your tap, and your tap sets the bar length for the novelty measure; **x** clears it), and **c**, **b**, **d** mark a change, a build or a drop at that moment. Marks go to `lampster-marks.jsonl` in the directory you ran it from, so you can compare what you heard with what the numbers did. The novelty measure is not used by `reactive` yet.
+
 ## Good to know
 
 - The lamp talks to one device at a time. Force-quit the phone app before running anything here, and note that a running `fade` or `sun` holds the connection, so the app cannot connect until you stop it.

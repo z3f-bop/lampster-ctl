@@ -11,17 +11,20 @@
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
   lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers (LAMPSTER_AUDIO_INPUT=name part)
+  lampster.py monitor [BPM]               # live browser view of the audio analysis, with keys to mark what you hear
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
 """
 import asyncio
 import colorsys
+import json
 import math
 import os
 import random
 import sys
 import time
+import webbrowser
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -55,6 +58,8 @@ RISER_RATIO = 1.3  # highs this far above their slow average, with no kick for a
 RISER_SECONDS = 8  # how long the whites take to swell to full
 RISER_TIMEOUT = 24
 WHITE_EVERY = 4 # every Nth kick is white instead of a colour; 0 for colours only
+MONITOR_PORT = 8787
+CHANGE_NOVELTY = 0.2  # the last bar this far from the last 8 bars' average counts as a change in the groove
 QUIET_LEVEL = 0.05  # brightness the lamp settles to once the music stops
 QUIET_FADE = 5  # seconds it takes to get there, starting half a second after the last sound
 DROP_FLASH = 0.15  # seconds of full light when the kick returns after a riser
@@ -346,6 +351,155 @@ async def disco(c, args):
         await asyncio.sleep(max(0, t0 + n * beat - time.monotonic()))
 
 
+MONITOR_HTML = """<!doctype html><meta charset=utf-8><title>Lampster monitor</title>
+<style>
+:root{--bg:#0d0d12;--fg:#e8e8f0;--dim:#8a8aa0;--grid:#23232e}
+@media (prefers-color-scheme:light){:root{--bg:#f6f6fa;--fg:#14141c;--dim:#6a6a80;--grid:#dcdce6}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}
+main{max-width:1240px;margin:0 auto;padding:16px}
+.row{display:flex;gap:24px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px}
+.big{font-size:40px;font-weight:700;font-variant-numeric:tabular-nums}
+.dim{color:var(--dim)}
+canvas{width:100%;height:420px;display:block;background:var(--bg);border:1px solid var(--grid);border-radius:8px}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--grid);background:transparent;color:var(--fg);cursor:pointer}
+#state{font-weight:700;padding:2px 10px;border-radius:6px}
+.key{color:var(--dim);font-size:13px}
+</style>
+<main>
+<div class=row><div><div class=dim>tempo (folded)</div><div class=big id=bpm>--</div></div>
+<div><div class=dim>your tap <span class=key id=diff>tap the beat</span></div><div class=big id=tap>--</div></div>
+<div><div class=dim>novelty</div><div class=big id=nov>--</div></div>
+<div><div class=dim>groove</div><div class=big id=state>--</div></div></div>
+<canvas id=c width=2400 height=840></canvas>
+<div class=row style="margin-top:10px"><button onclick="tap()">Tap tempo <span class=key>[space]</span></button>
+<button onclick="mark('change')">Change <span class=key>[c]</span></button>
+<button onclick="mark('build')">Build <span class=key>[b]</span></button>
+<button onclick="mark('drop')">Drop <span class=key>[d]</span></button>
+<span class=dim>Tap the beat with space (x clears). Mark what you hear. Marks are saved to lampster-marks.jsonl. White: novelty. Blue: low band. Orange: high band. Ticks: kicks.</span></div>
+</main>
+<script>
+const SPAN=120,frames=[],marks=[],c=document.getElementById('c'),x=c.getContext('2d');
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function mark(label){fetch('/mark?label='+label,{method:'POST'})}
+let taps=[],tapBpm=null,detected=null;
+function tap(){const n=performance.now();if(taps.length&&n-taps[taps.length-1]>2500)taps=[];taps.push(n);taps=taps.slice(-9);
+ if(taps.length>1){tapBpm=60000/((taps[taps.length-1]-taps[0])/(taps.length-1));fetch('/tempo?bpm='+tapBpm.toFixed(2),{method:'POST'})}show()}
+function show(){document.getElementById('tap').textContent=tapBpm?tapBpm.toFixed(1):'--';
+ document.getElementById('diff').textContent=tapBpm&&detected?'detector '+(detected>tapBpm?'+':'')+(detected-tapBpm).toFixed(1)+' BPM off':'tap the beat'}
+addEventListener('keydown',e=>{if(e.repeat)return;if(e.key===' '){e.preventDefault();tap()}else if(e.key==='c')mark('change');else if(e.key==='b')mark('build');else if(e.key==='d')mark('drop');else if(e.key==='x'){taps=[];tapBpm=null;fetch('/tempo?bpm=0',{method:'POST'});show()}});
+const es=new EventSource('/events');
+es.onmessage=m=>{const f=JSON.parse(m.data);frames.push(f);if(f.mark)marks.push({t:f.t,label:f.mark});
+ while(frames.length&&frames[0].t<f.t-SPAN)frames.shift();
+ detected=f.bpm;document.getElementById('bpm').textContent=f.bpm?f.bpm.toFixed(1):'--';show();
+ document.getElementById('nov').textContent=f.novelty.toFixed(2);
+ const st=document.getElementById('state'),ch=f.novelty>f.threshold;
+ st.textContent=ch?'CHANGE':'steady';st.style.background=ch?'#d4358c':'transparent';st.style.color=ch?'#fff':css('--dim');draw()};
+function draw(){const W=c.width,H=c.height,t1=frames.length?frames[frames.length-1].t:0,t0=t1-SPAN;
+ x.clearRect(0,0,W,H);x.strokeStyle=css('--grid');x.lineWidth=2;
+ for(let i=1;i<4;i++){x.beginPath();x.moveTo(0,H*i/4);x.lineTo(W,H*i/4);x.stroke()}
+ const X=t=>(t-t0)/SPAN*W,Y=(v,max)=>H-18-Math.min(v/max,1)*(H-40);
+ const line=(key,max,color)=>{x.strokeStyle=color;x.lineWidth=3;x.beginPath();frames.forEach((f,i)=>{const px=X(f.t),py=Y(f[key],max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()};
+ line('low',2.6,'#3b82f6');line('high',0.6,'#f59e0b');line('novelty',1,css('--fg'));
+ if(frames.length){x.strokeStyle='#d4358c';x.setLineDash([10,10]);x.lineWidth=2;const y=Y(frames[frames.length-1].threshold,1);x.beginPath();x.moveTo(0,y);x.lineTo(W,y);x.stroke();x.setLineDash([])}
+ x.fillStyle=css('--dim');frames.forEach(f=>{if(f.kick)x.fillRect(X(f.t),H-12,3,12)});
+ marks.forEach(m=>{if(m.t<t0)return;x.strokeStyle='#d4358c';x.lineWidth=3;x.beginPath();x.moveTo(X(m.t),0);x.lineTo(X(m.t),H);x.stroke();x.fillStyle='#d4358c';x.font='28px system-ui';x.fillText(m.label,X(m.t)+8,34)})}
+</script>"""
+
+
+async def monitor(args):
+    """Serve a live browser view of the audio analysis: spectrum bands, novelty against the last 8 bars,
+    kicks and tempo. Keys in the page drop timestamped marks into lampster-marks.jsonl."""
+    import numpy as np
+    import sounddevice as sd
+
+    bpm_hint = float(args[0]) if args else PRIOR_BPM
+    device = os.environ.get("LAMPSTER_AUDIO_INPUT")
+    rate = sd.query_devices(device, "input")["default_samplerate"]
+    size, hop = 2048, 1024
+    window = np.hanning(size)
+    freqs = np.fft.rfftfreq(size, 1 / rate)
+    edges = np.geomspace(40, 12000, 11)
+    groups = [(freqs >= lo) & (freqs < hi) for lo, hi in zip(edges, edges[1:])]
+    bass_bins = (freqs >= BASS_HZ[0]) & (freqs <= BASS_HZ[1])
+    block_rate = rate / hop
+    ring = np.zeros(size, dtype=np.float32)
+    heard, clients, pending_marks, state = [], set(), [], {"tap": None}
+    history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
+
+    def hear(indata, frames, time_info, status):
+        nonlocal ring
+        ring = np.concatenate([ring[frames:], indata[:, 0]])
+        spectrum = np.abs(np.fft.rfft(ring * window))
+        heard.append(([float(np.log1p(spectrum[g].mean())) for g in groups], float(np.sqrt(np.mean(spectrum[bass_bins] ** 2)))))
+
+    async def serve(reader, writer):
+        request = (await reader.readline()).decode().split()
+        while (await reader.readline()).strip():
+            pass
+        path = request[1] if len(request) > 1 else "/"
+        if path.startswith("/events"):
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
+            await writer.drain()
+            clients.add(writer)
+            return
+        if path.startswith("/tempo"):
+            state["tap"] = float(path.partition("bpm=")[2] or 0) or None
+            body, kind = b"ok", b"text/plain"
+        elif path.startswith("/mark"):
+            pending_marks.append(path.partition("label=")[2] or "mark")
+            body, kind = b"ok", b"text/plain"
+        else:
+            body, kind = MONITOR_HTML.encode(), b"text/html; charset=utf-8"
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: " + kind + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", MONITOR_PORT)
+    url = f"http://localhost:{MONITOR_PORT}"
+    print(f"monitor at {url} (Ctrl-C to stop)", flush=True)
+    webbrowser.open(url)
+    short = long = None
+    bar = 4 * 60 / bpm_hint
+    bass_avg, peak, last_kick, last_tempo, bpm = None, 0.0, 0.0, 0.0, None
+    t0 = time.monotonic()
+    with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=hop, callback=hear), open("lampster-marks.jsonl", "a") as marks_file:
+        while True:
+            await asyncio.sleep(0.1)
+            now = time.monotonic()
+            blocks, heard[:] = heard[:], []
+            kick = False
+            for vector, bass in blocks:
+                v = np.array(vector)
+                if short is None:
+                    short, long = v.copy(), v.copy()
+                short += (v - short) / (bar * block_rate)
+                long += (v - long) / (8 * bar * block_rate)
+                history.append(bass)
+                peak = max(bass, peak * PEAK_DECAY)
+                bass_avg = bass if bass_avg is None else bass_avg + (bass - bass_avg) / 43
+                if bass > SILENCE and bass > BEAT_RATIO * bass_avg and bass > KICK_SHARE * peak and now - last_kick > MIN_BEAT_GAP:
+                    last_kick, kick = now, True
+            if short is None:
+                continue
+            if now - last_tempo > 1.0 and len(history) > block_rate * 4:
+                last_tempo, bpm = now, fold_tempo(history, block_rate)
+            bar = 4 * 60 / (state["tap"] or bpm or bpm_hint)  # a tapped tempo overrides the detector
+            label = pending_marks.pop(0) if pending_marks else None
+            frame = {"t": now - t0, "novelty": float(np.abs(short - long).sum() / max(long.sum(), 1e-9)),
+                     "low": float(short[:3].mean()), "high": float(short[7:].mean()), "kick": kick, "bpm": bpm,
+                     "threshold": CHANGE_NOVELTY, "mark": label}
+            if label:
+                marks_file.write(json.dumps({"t": round(frame["t"], 2), "label": label, "novelty": round(frame["novelty"], 3)}) + "\n")
+                marks_file.flush()
+            message = f"data: {json.dumps(frame)}\n\n".encode()
+            for client in list(clients):
+                try:
+                    client.write(message)
+                    await client.drain()
+                except (ConnectionError, OSError):
+                    clients.discard(client)
+
+
 async def run(c, argv):
     if argv[0] == "fade":
         await fade(c, float(argv[1]), parse_color(argv[2:]))
@@ -367,12 +521,14 @@ async def run(c, argv):
 
 
 async def main(argv):
-    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive"):
+    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive", "monitor"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
     if argv[0] == "sun" and (math.isnan(LAT) or math.isnan(LON)):
         sys.exit("sun needs LAMPSTER_LAT and LAMPSTER_LON in the environment (degrees, east positive)")
+    if argv[0] == "monitor":
+        return await monitor(argv[1:])
     long_running, drops = argv[0] in ("sun", "disco", "reactive"), 0
     while True:
         lamp = await BleakScanner.find_device_by_name(NAME, timeout=15)
