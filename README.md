@@ -30,6 +30,16 @@ LAMPSTER_LAT=48.86 LAMPSTER_LON=2.35 ./lampster.py sun
 
 **Photosensitivity:** strobing can trigger seizures in people with photosensitive epilepsy. The burst is held to 3 flashes per second, the common guideline ceiling, and `STROBE_HZ` is a constant you should leave there, especially with guests around. Set `STROBE_CHANCE` to 0 for no strobes at all.
 
+## Reactive mode
+
+`./lampster.py reactive [SECONDS]` listens to an audio input and flashes a new colour on every bass beat, then lets the light decay until the next one. It uses the system's default input (the microphone), so it works for any room with music in it. For a clean digital signal, route the computer's output to a loopback device such as [BlackHole](https://existential.audio/blackhole/) through a Multi-Output Device in Audio MIDI Setup, and name it:
+
+```bash
+LAMPSTER_AUDIO_INPUT=BlackHole ./lampster.py reactive
+```
+
+The beat detector looks at 30-150 Hz energy against its own running average (`BASS_HZ`, `BEAT_RATIO`, `SILENCE` at the top of the script). Laptop speakers have little bass, so with a microphone you may need to lower `SILENCE`. The terminal needs microphone permission the first time. Like disco, it needs `uv` to fetch `numpy` and `sounddevice`.
+
 ## Good to know
 
 - The lamp talks to one device at a time. Force-quit the phone app before running anything here, and note that a running `fade` or `sun` holds the connection, so the app cannot connect until you stop it.

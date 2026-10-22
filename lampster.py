@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["bleak"]
+# dependencies = ["bleak", "numpy", "sounddevice"]
 # ///
 """Control The Lampster over Bluetooth LE.
 
@@ -10,6 +10,7 @@
   lampster.py white WARM COOL  # 0-100 each
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
+  lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input (LAMPSTER_AUDIO_INPUT=name part)
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
@@ -19,6 +20,7 @@ import colorsys
 import math
 import os
 import random
+import statistics
 import sys
 import time
 from datetime import datetime, timedelta
@@ -35,6 +37,13 @@ FADE_STEP = 0.25  # seconds between fade writes
 LAT, LON = (float(os.environ.get(k, "nan")) for k in ("LAMPSTER_LAT", "LAMPSTER_LON"))  # degrees, east positive
 STROBE_HZ = 3  # flashes per second, at the photosensitivity guideline limit; never raise this
 STROBE_CHANCE = 0.3  # per 8-beat phrase
+AUDIO_FPS = 25  # lamp updates per second in reactive mode
+BASS_HZ = (30, 150)  # band whose energy marks a beat
+BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
+MIN_BEAT_GAP = 0.25  # seconds; nothing faster than 240 BPM counts
+SILENCE = 0.5  # bass energy below this is not a beat
+DECAY = 0.85  # brightness kept per update after a beat
+FLOOR = 0.12  # dimmest the lamp gets between beats
 SUN_TICK = 30  # seconds between sun updates at real-time speed
 # (solar elevation deg, R, G, B, warm, cool): red at the horizon, white warming up and cooling by noon, dark by -12
 MOON_LEVELS = (0, 0, 8, 0, 12)  # [R, G, B, warm, cool] a full moon at the zenith adds: faint cool blue-white
@@ -168,6 +177,53 @@ async def sun(c, args):
         await asyncio.sleep(max(0.5, SUN_TICK / speed))
 
 
+async def reactive(c, args):
+    """Flash a new colour on each bass beat heard on the audio input, then let it decay."""
+    import numpy as np
+    import sounddevice as sd
+
+    seconds = float(args[0]) if args else None
+    device = os.environ.get("LAMPSTER_AUDIO_INPUT")
+    rate = sd.query_devices(device, "input")["default_samplerate"]
+    size = 2048
+    window = np.hanning(size)
+    lo, hi = (int(hz * size / rate) for hz in BASS_HZ)
+    ring = np.zeros(size, dtype=np.float32)
+    energies = []
+
+    def hear(indata, frames, time_info, status):
+        nonlocal ring
+        ring = np.concatenate([ring[frames:], indata[:, 0]])
+        energies.append(float(np.sqrt(np.mean(np.abs(np.fft.rfft(ring * window))[lo:hi] ** 2))))
+
+    keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
+    await c.write_gatt_char(WHITE, bytes([0, 0]), response=True)
+    await c.write_gatt_char(COLOR, bytes([0, 0, 0]), response=False)
+    await c.write_gatt_char(MODE, bytes([MODES["color"] | keep]), response=True)
+    hue, brightness, average, last_beat, last_sent = random.random(), FLOOR, None, 0.0, None
+    beats, t0, peak = [], time.monotonic(), 0.0
+    with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=1024, callback=hear):
+        while seconds is None or time.monotonic() - t0 < seconds:
+            heard, energies[:] = energies[:], []
+            for e in heard:
+                peak = max(peak, e)
+                average = e if average is None else average + (e - average) / 43
+                now = time.monotonic()
+                if e > SILENCE and e > BEAT_RATIO * average and now - last_beat > MIN_BEAT_GAP:
+                    beats.append(now)
+                    last_beat, brightness = now, 1.0
+                    hue = (hue + random.uniform(0.2, 0.6)) % 1
+            brightness = max(FLOOR, brightness * DECAY)
+            rgb = bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, brightness))
+            if rgb != last_sent:
+                await c.write_gatt_char(COLOR, rgb, response=False)
+                last_sent = rgb
+            await asyncio.sleep(1 / AUDIO_FPS)
+    gaps = [b - a for a, b in zip(beats, beats[1:])]
+    print(f"{len(beats)} beats in {time.monotonic() - t0:.0f}s, peak bass energy {peak:.1f}"
+          + (f", median gap {statistics.median(gaps) * 1000:.0f} ms (~{60 / statistics.median(gaps):.0f} BPM)" if gaps else ""))
+
+
 async def disco(c, args):
     """A new vivid colour on every beat; at the end of some 8-beat phrases a short white strobe burst."""
     beat = 60 / (float(args[0]) if args else 128.0)
@@ -192,7 +248,7 @@ async def disco(c, args):
 
 
 async def main(argv):
-    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco"):
+    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
@@ -204,6 +260,8 @@ async def main(argv):
     async with BleakClient(lamp, timeout=20) as c:
         if argv[0] == "fade":
             await fade(c, float(argv[1]), parse_color(argv[2:]))
+        elif argv[0] == "reactive":
+            await reactive(c, argv[1:])
         elif argv[0] == "disco":
             await disco(c, argv[1:])
         elif argv[0] == "sun":
