@@ -10,7 +10,7 @@
   lampster.py white WARM COOL  # 0-100 each
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
-  lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input (LAMPSTER_AUDIO_INPUT=name part)
+  lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers (LAMPSTER_AUDIO_INPUT=name part)
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timedelta
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakGATTProtocolError
 
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
@@ -41,7 +42,16 @@ AUDIO_FPS = 25  # lamp updates per second in reactive mode
 BASS_HZ = (30, 150)  # band whose energy marks a beat
 BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
 MIN_BEAT_GAP = 0.25  # seconds; nothing faster than 240 BPM counts
-SILENCE = 0.5  # bass energy below this is not a beat
+HIGH_HZ = (2000, 8000)  # band whose climb marks a riser
+KICK_SHARE = 0.3  # a kick must also reach this share of the recent peak, so volume does not matter
+PEAK_DECAY = 0.999  # per audio block; the recent peak halves in about 16 s
+RISER_RATIO = 1.3  # highs this far above their slow average, with no kick for a second, start a riser
+RISER_SECONDS = 8  # how long the whites take to swell to full
+RISER_TIMEOUT = 24
+QUIET_LEVEL = 0.05  # brightness the lamp settles to once the music stops
+QUIET_FADE = 5  # seconds it takes to get there, starting half a second after the last sound
+DROP_FLASH = 0.15  # seconds of full light when the kick returns after a riser
+SILENCE = 0.3  # energy below this is not a beat
 DECAY = 0.85  # brightness kept per update after a beat
 FLOOR = 0.12  # dimmest the lamp gets between beats
 SUN_TICK = 30  # seconds between sun updates at real-time speed
@@ -178,7 +188,8 @@ async def sun(c, args):
 
 
 async def reactive(c, args):
-    """Flash a new colour on each bass beat heard on the audio input, then let it decay."""
+    """Flash a new colour on each bass beat. When the kick drops out and the highs climb (a riser) the whites
+    swell and pulse, and the kick coming back is answered by one full flash."""
     import numpy as np
     import sounddevice as sd
 
@@ -187,40 +198,75 @@ async def reactive(c, args):
     rate = sd.query_devices(device, "input")["default_samplerate"]
     size = 2048
     window = np.hanning(size)
-    lo, hi = (int(hz * size / rate) for hz in BASS_HZ)
+    bins = {name: slice(*(int(hz * size / rate) for hz in span)) for name, span in (("bass", BASS_HZ), ("high", HIGH_HZ))}
     ring = np.zeros(size, dtype=np.float32)
-    energies = []
+    heard = []
 
     def hear(indata, frames, time_info, status):
         nonlocal ring
         ring = np.concatenate([ring[frames:], indata[:, 0]])
-        energies.append(float(np.sqrt(np.mean(np.abs(np.fft.rfft(ring * window))[lo:hi] ** 2))))
+        spectrum = np.abs(np.fft.rfft(ring * window))
+        heard.append(tuple(float(np.sqrt(np.mean(spectrum[bins[n]] ** 2))) for n in ("bass", "high")))
 
     keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
     await c.write_gatt_char(WHITE, bytes([0, 0]), response=True)
     await c.write_gatt_char(COLOR, bytes([0, 0, 0]), response=False)
-    await c.write_gatt_char(MODE, bytes([MODES["color"] | keep]), response=True)
-    hue, brightness, average, last_beat, last_sent = random.random(), FLOOR, None, 0.0, None
-    beats, t0, peak = [], time.monotonic(), 0.0
+    await c.write_gatt_char(MODE, bytes([MODES["both"] | keep]), response=True)  # RGB and white banks both live
+    hue, level, last_beat, flash_until = random.random(), FLOOR, 0.0, 0.0
+    bass_avg = high_slow = high_fast = None
+    peak, riser, last_sent, quiet_since = 0.0, None, None, None
+    gaps, kicks, risers, drops, refused = [], 0, 0, 0, 0
+    t0 = time.monotonic()
     with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=1024, callback=hear):
         while seconds is None or time.monotonic() - t0 < seconds:
-            heard, energies[:] = energies[:], []
-            for e in heard:
-                peak = max(peak, e)
-                average = e if average is None else average + (e - average) / 43
-                now = time.monotonic()
-                if e > SILENCE and e > BEAT_RATIO * average and now - last_beat > MIN_BEAT_GAP:
-                    beats.append(now)
-                    last_beat, brightness = now, 1.0
+            blocks, heard[:] = heard[:], []
+            now = time.monotonic()
+            for bass, high in blocks:
+                peak = max(bass, peak * PEAK_DECAY)  # follows the track's own loudness, so volume does not matter
+                if bass_avg is None:
+                    bass_avg, high_slow, high_fast = bass, high, high
+                if bass < SILENCE and high < SILENCE:
+                    quiet_since = quiet_since or now
+                else:
+                    quiet_since = None
+                bass_avg += (bass - bass_avg) / 43
+                high_slow += (high - high_slow) / 130
+                high_fast += (high - high_fast) / 20
+                if bass > SILENCE and bass > BEAT_RATIO * bass_avg and bass > KICK_SHARE * peak and now - last_beat > MIN_BEAT_GAP:
+                    if last_beat:
+                        gaps = (gaps + [now - last_beat])[-16:]
+                    last_beat, kicks = now, kicks + 1
+                    if riser and now - riser > 1.5:
+                        flash_until, drops, riser = now + DROP_FLASH, drops + 1, None
+                    riser = None  # a kick ends any riser, with a flash only if it had built long enough
+                    level = 1.0
                     hue = (hue + random.uniform(0.2, 0.6)) % 1
-            brightness = max(FLOOR, brightness * DECAY)
-            rgb = bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, brightness))
-            if rgb != last_sent:
-                await c.write_gatt_char(COLOR, rgb, response=False)
-                last_sent = rgb
+                elif riser is None and now - last_beat > 1.0 and high > SILENCE and high_fast > RISER_RATIO * high_slow:
+                    riser, risers = now, risers + 1
+            if riser and (now - riser > RISER_TIMEOUT or high_fast < 0.7 * high_slow):
+                riser = None  # the build fizzled out
+            fade = 0 if quiet_since is None else min(1, max(0, (now - quiet_since - 0.5) / QUIET_FADE))
+            level = max(FLOOR + (QUIET_LEVEL - FLOOR) * fade, level * DECAY)
+            if now < flash_until:
+                out = (bytes([100] * 3), bytes([100, 100]))
+            elif riser:
+                swell = min(1.0, (now - riser) / RISER_SECONDS)
+                beat_hz = 60 / statistics.median(gaps) if len(gaps) >= 4 else 2.0
+                hz = min(STROBE_HZ, beat_hz * (0.5 + 3.5 * swell))  # beat-synced, ramping up, never past the cap
+                lit = int((now - riser) * hz * 2) % 2 == 0
+                out = (bytes(3), bytes([round(60 * (1 - swell)), round(100 * swell)]) if lit else bytes(2))
+            else:
+                out = (bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, level)), bytes(2))
+            if out != last_sent:
+                await c.write_gatt_char(COLOR, out[0], response=False)
+                if last_sent is None or out[1] != last_sent[1]:
+                    try:
+                        await c.write_gatt_char(WHITE, out[1], response=True)
+                    except BleakGATTProtocolError:
+                        out, refused = (out[0], None), refused + 1  # lamp was busy: whites go out again next tick
+                last_sent = out
             await asyncio.sleep(1 / AUDIO_FPS)
-    gaps = [b - a for a, b in zip(beats, beats[1:])]
-    print(f"{len(beats)} beats in {time.monotonic() - t0:.0f}s, peak bass energy {peak:.1f}"
+    print(f"{kicks} kicks in {time.monotonic() - t0:.0f}s, {risers} risers, {drops} drops, {refused} white writes refused, peak bass energy {peak:.1f}"
           + (f", median gap {statistics.median(gaps) * 1000:.0f} ms (~{60 / statistics.median(gaps):.0f} BPM)" if gaps else ""))
 
 
