@@ -20,9 +20,9 @@ import colorsys
 import math
 import os
 import random
-import statistics
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta
 
 from bleak import BleakClient, BleakScanner
@@ -38,22 +38,26 @@ FADE_STEP = 0.25  # seconds between fade writes
 LAT, LON = (float(os.environ.get(k, "nan")) for k in ("LAMPSTER_LAT", "LAMPSTER_LON"))  # degrees, east positive
 STROBE_HZ = 3  # flashes per second, at the photosensitivity guideline limit; never raise this
 STROBE_CHANCE = 0.3  # per 8-beat phrase
-AUDIO_FPS = 25  # lamp updates per second in reactive mode
+AUDIO_FPS = 40  # lamp updates per second in reactive mode
 BASS_HZ = (30, 150)  # band whose energy marks a beat
 BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
-MIN_BEAT_GAP = 0.25  # seconds; nothing faster than 240 BPM counts
+MIN_BEAT_GAP = 0.15  # seconds between raw kick detections
+DANCE_BPM = (70, 140)  # the range people move to: faster is danced at half speed, slower at double
+PRIOR_BPM = 110  # tempo people find most natural, used to break ties between octaves
+TEMPO_WINDOW = 10  # seconds of bass history the tempo estimate looks at
 HIGH_HZ = (2000, 8000)  # band whose climb marks a riser
 KICK_SHARE = 0.3  # a kick must also reach this share of the recent peak, so volume does not matter
 PEAK_DECAY = 0.999  # per audio block; the recent peak halves in about 16 s
 RISER_RATIO = 1.3  # highs this far above their slow average, with no kick for a second, start a riser
 RISER_SECONDS = 8  # how long the whites take to swell to full
 RISER_TIMEOUT = 24
+WHITE_EVERY = 4 # every Nth kick is white instead of a colour; 0 for colours only
 QUIET_LEVEL = 0.05  # brightness the lamp settles to once the music stops
 QUIET_FADE = 5  # seconds it takes to get there, starting half a second after the last sound
 DROP_FLASH = 0.15  # seconds of full light when the kick returns after a riser
 SILENCE = 0.3  # energy below this is not a beat
-DECAY = 0.85  # brightness kept per update after a beat
-FLOOR = 0.12  # dimmest the lamp gets between beats
+DECAY = 0.7  # brightness kept per update after a beat; lower is spikier
+FLOOR = 0.06  # dimmest the lamp gets between beats
 SUN_TICK = 30  # seconds between sun updates at real-time speed
 # (solar elevation deg, R, G, B, warm, cool): red at the horizon, white warming up and cooling by noon, dark by -12
 MOON_LEVELS = (0, 0, 8, 0, 12)  # [R, G, B, warm, cool] a full moon at the zenith adds: faint cool blue-white
@@ -187,6 +191,25 @@ async def sun(c, args):
         await asyncio.sleep(max(0.5, SUN_TICK / speed))
 
 
+def fold_tempo(energies, block_rate):
+    """Tempo from the autocorrelation of the bass onsets, folded into DANCE_BPM."""
+    import numpy as np
+
+    flux = np.maximum(0, np.diff(np.asarray(energies)))
+    flux = flux - flux.mean()
+    ac = np.maximum(0, np.correlate(flux, flux, "full")[len(flux) - 1:])
+    lags = np.arange(int(block_rate * 60 / 200), min(len(ac), int(block_rate * 60 / 55)))
+    if len(lags) == 0 or ac[0] <= 0:
+        return None
+    bpms = 60 * block_rate / lags
+    bpm = float(bpms[np.argmax(ac[lags] * np.exp(-0.5 * (np.log2(bpms / PRIOR_BPM) / 0.6) ** 2))])
+    while bpm < DANCE_BPM[0]:
+        bpm *= 2
+    while bpm >= DANCE_BPM[1]:
+        bpm /= 2
+    return bpm
+
+
 async def reactive(c, args):
     """Flash a new colour on each bass beat. When the kick drops out and the highs climb (a riser) the whites
     swell and pulse, and the kick coming back is answered by one full flash."""
@@ -214,8 +237,20 @@ async def reactive(c, args):
     await c.write_gatt_char(MODE, bytes([MODES["both"] | keep]), response=True)  # RGB and white banks both live
     hue, level, last_beat, flash_until = random.random(), FLOOR, 0.0, 0.0
     bass_avg = high_slow = high_fast = None
-    peak, riser, last_sent, quiet_since = 0.0, None, None, None
-    gaps, kicks, risers, drops, refused = [], 0, 0, 0, 0
+    peak, riser, last_sent, quiet_since, white_hit = 0.0, None, None, None, False
+    kicks, risers, drops, refused, hits = 0, 0, 0, 0, 0
+    block_rate = rate / 1024
+    history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
+    period, last_hit, last_tempo = 60 / PRIOR_BPM, 0.0, 0.0
+
+    def hit(when):
+        """One beat of the lamp: a spike, in a new colour or (every WHITE_EVERY-th) white."""
+        nonlocal level, hue, white_hit, hits, last_hit
+        last_hit, hits, level = when, hits + 1, 1.0
+        white_hit = bool(WHITE_EVERY) and hits % WHITE_EVERY == 0
+        if not white_hit:
+            hue = (hue + random.uniform(0.2, 0.6)) % 1
+
     t0 = time.monotonic()
     with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=1024, callback=hear):
         while seconds is None or time.monotonic() - t0 < seconds:
@@ -229,20 +264,25 @@ async def reactive(c, args):
                     quiet_since = quiet_since or now
                 else:
                     quiet_since = None
+                history.append(bass)
                 bass_avg += (bass - bass_avg) / 43
                 high_slow += (high - high_slow) / 130
                 high_fast += (high - high_fast) / 20
                 if bass > SILENCE and bass > BEAT_RATIO * bass_avg and bass > KICK_SHARE * peak and now - last_beat > MIN_BEAT_GAP:
-                    if last_beat:
-                        gaps = (gaps + [now - last_beat])[-16:]
                     last_beat, kicks = now, kicks + 1
                     if riser and now - riser > 1.5:
-                        flash_until, drops, riser = now + DROP_FLASH, drops + 1, None
+                        flash_until, drops = now + DROP_FLASH, drops + 1
                     riser = None  # a kick ends any riser, with a flash only if it had built long enough
-                    level = 1.0
-                    hue = (hue + random.uniform(0.2, 0.6)) % 1
+                    if now - last_hit >= 0.75 * period:  # faster kicks than the dance tempo are skipped
+                        hit(now)
                 elif riser is None and now - last_beat > 1.0 and high > SILENCE and high_fast > RISER_RATIO * high_slow:
                     riser, risers = now, risers + 1
+            if now - last_tempo > 1.0 and len(history) > block_rate * 4:
+                last_tempo, bpm = now, fold_tempo(history, block_rate)
+                if bpm:
+                    period += (60 / bpm - period) / 2
+            if last_beat and quiet_since is None and not riser and now - last_beat < 2.5 and now - last_hit >= 1.1 * period:
+                hit(now)  # kicks slower than the dance tempo get the beats in between
             if riser and (now - riser > RISER_TIMEOUT or high_fast < 0.7 * high_slow):
                 riser = None  # the build fizzled out
             fade = 0 if quiet_since is None else min(1, max(0, (now - quiet_since - 0.5) / QUIET_FADE))
@@ -251,10 +291,12 @@ async def reactive(c, args):
                 out = (bytes([100] * 3), bytes([100, 100]))
             elif riser:
                 swell = min(1.0, (now - riser) / RISER_SECONDS)
-                beat_hz = 60 / statistics.median(gaps) if len(gaps) >= 4 else 2.0
+                beat_hz = 1 / period
                 hz = min(STROBE_HZ, beat_hz * (0.5 + 3.5 * swell))  # beat-synced, ramping up, never past the cap
                 lit = int((now - riser) * hz * 2) % 2 == 0
                 out = (bytes(3), bytes([round(60 * (1 - swell)), round(100 * swell)]) if lit else bytes(2))
+            elif white_hit:
+                out = (bytes(3), bytes([round(30 * level), round(100 * level)]))  # crisp white: a little warm under the cool
             else:
                 out = (bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, level)), bytes(2))
             if out != last_sent:
@@ -266,8 +308,8 @@ async def reactive(c, args):
                         out, refused = (out[0], None), refused + 1  # lamp was busy: whites go out again next tick
                 last_sent = out
             await asyncio.sleep(1 / AUDIO_FPS)
-    print(f"{kicks} kicks in {time.monotonic() - t0:.0f}s, {risers} risers, {drops} drops, {refused} white writes refused, peak bass energy {peak:.1f}"
-          + (f", median gap {statistics.median(gaps) * 1000:.0f} ms (~{60 / statistics.median(gaps):.0f} BPM)" if gaps else ""))
+    print(f"{kicks} kicks, {hits} lamp beats in {time.monotonic() - t0:.0f}s at ~{60 / period:.0f} BPM, "
+          f"{risers} risers, {drops} drops, {refused} white writes refused, peak bass energy {peak:.1f}")
 
 
 async def disco(c, args):
