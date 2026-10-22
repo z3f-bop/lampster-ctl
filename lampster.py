@@ -26,7 +26,7 @@ from collections import deque
 from datetime import datetime, timedelta
 
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakGATTProtocolError
+from bleak.exc import BleakError, BleakGATTProtocolError
 
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
@@ -42,9 +42,12 @@ AUDIO_FPS = 40  # lamp updates per second in reactive mode
 BASS_HZ = (30, 150)  # band whose energy marks a beat
 BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
 MIN_BEAT_GAP = 0.15  # seconds between raw kick detections
-DANCE_BPM = (70, 140)  # the range people move to: faster is danced at half speed, slower at double
+DANCE_BPM = (82, 165)  # the range people move to (hard techno stays at full speed, drum and bass halves): faster is danced at half speed, slower at double
 PRIOR_BPM = 110  # tempo people find most natural, used to break ties between octaves
 TEMPO_WINDOW = 10  # seconds of bass history the tempo estimate looks at
+TEMPO_SMOOTH = 0.08  # share of each new estimate taken per second, so the tempo drifts instead of jumping
+TEMPO_JUMP = 0.12  # an estimate this far from the smoothed tempo...
+TEMPO_SNAP = 5  # ...for this many seconds in a row is a new track, and the tempo snaps to it
 HIGH_HZ = (2000, 8000)  # band whose climb marks a riser
 KICK_SHARE = 0.3  # a kick must also reach this share of the recent peak, so volume does not matter
 PEAK_DECAY = 0.999  # per audio block; the recent peak halves in about 16 s
@@ -241,7 +244,7 @@ async def reactive(c, args):
     kicks, risers, drops, refused, hits = 0, 0, 0, 0, 0
     block_rate = rate / 1024
     history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
-    period, last_hit, last_tempo = 60 / PRIOR_BPM, 0.0, 0.0
+    period, last_hit, last_tempo, tempo_known, disagreed = 60 / PRIOR_BPM, 0.0, 0.0, False, 0
 
     def hit(when):
         """One beat of the lamp: a spike, in a new colour or (every WHITE_EVERY-th) white."""
@@ -280,7 +283,15 @@ async def reactive(c, args):
             if now - last_tempo > 1.0 and len(history) > block_rate * 4:
                 last_tempo, bpm = now, fold_tempo(history, block_rate)
                 if bpm:
-                    period += (60 / bpm - period) / 2
+                    estimate = 60 / bpm
+                    disagreed = disagreed + 1 if abs(estimate - period) > TEMPO_JUMP * period else 0
+                    if not tempo_known or disagreed >= TEMPO_SNAP:
+                        period, tempo_known, disagreed = estimate, True, 0
+                    else:
+                        period += (estimate - period) * TEMPO_SMOOTH
+            if quiet_since and now - quiet_since > 2:
+                history.clear()  # between tracks: start the tempo over
+                tempo_known = False
             if last_beat and quiet_since is None and not riser and now - last_beat < 2.5 and now - last_hit >= 1.1 * period:
                 hit(now)  # kicks slower than the dance tempo get the beats in between
             if riser and (now - riser > RISER_TIMEOUT or high_fast < 0.7 * high_slow):
@@ -335,6 +346,26 @@ async def disco(c, args):
         await asyncio.sleep(max(0, t0 + n * beat - time.monotonic()))
 
 
+async def run(c, argv):
+    if argv[0] == "fade":
+        await fade(c, float(argv[1]), parse_color(argv[2:]))
+    elif argv[0] == "reactive":
+        await reactive(c, argv[1:])
+    elif argv[0] == "disco":
+        await disco(c, argv[1:])
+    elif argv[0] == "sun":
+        await sun(c, argv[1:])
+    elif argv[0] == "color":
+        await c.write_gatt_char(COLOR, bytes(parse_color(argv[1:])), response=False)
+    elif argv[0] == "mode":
+        keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
+        await c.write_gatt_char(MODE, bytes([MODES[argv[1]] | keep]), response=True)
+    elif argv[0] == "white":
+        await c.write_gatt_char(WHITE, bytes(int(a) for a in argv[1:]), response=True)
+    await asyncio.sleep(0.5)
+    await status(c)
+
+
 async def main(argv):
     if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive"):
         sys.exit(__doc__)
@@ -342,27 +373,21 @@ async def main(argv):
         sys.exit(__doc__)
     if argv[0] == "sun" and (math.isnan(LAT) or math.isnan(LON)):
         sys.exit("sun needs LAMPSTER_LAT and LAMPSTER_LON in the environment (degrees, east positive)")
-    lamp = await BleakScanner.find_device_by_name(NAME, timeout=15)
-    if lamp is None:
-        sys.exit(f"{NAME} not found: is it powered and is the phone app force-quit?")
-    async with BleakClient(lamp, timeout=20) as c:
-        if argv[0] == "fade":
-            await fade(c, float(argv[1]), parse_color(argv[2:]))
-        elif argv[0] == "reactive":
-            await reactive(c, argv[1:])
-        elif argv[0] == "disco":
-            await disco(c, argv[1:])
-        elif argv[0] == "sun":
-            await sun(c, argv[1:])
-        elif argv[0] == "color":
-            await c.write_gatt_char(COLOR, bytes(parse_color(argv[1:])), response=False)
-        elif argv[0] == "mode":
-            keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
-            await c.write_gatt_char(MODE, bytes([MODES[argv[1]] | keep]), response=True)
-        elif argv[0] == "white":
-            await c.write_gatt_char(WHITE, bytes(int(a) for a in argv[1:]), response=True)
-        await asyncio.sleep(0.5)
-        await status(c)
+    long_running, drops = argv[0] in ("sun", "disco", "reactive"), 0
+    while True:
+        lamp = await BleakScanner.find_device_by_name(NAME, timeout=15)
+        if lamp is None and not drops:
+            sys.exit(f"{NAME} not found: is it powered and is the phone app force-quit?")
+        if lamp:
+            try:
+                async with BleakClient(lamp, timeout=20) as c:
+                    return await run(c, argv)
+            except (BleakError, asyncio.TimeoutError) as error:
+                if not long_running:
+                    raise
+                drops += 1
+                print(f"lost the lamp ({error}), reconnecting", flush=True)
+        await asyncio.sleep(2)  # a long-running mode keeps trying until stopped
 
 
 asyncio.run(main(sys.argv[1:]))
