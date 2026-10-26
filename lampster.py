@@ -10,7 +10,8 @@
   lampster.py white WARM COOL  # 0-100 each
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
-  lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers (LAMPSTER_AUDIO_INPUT=name part)
+  lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers
+                                          # LAMPSTER_AUDIO_INPUT=name part of an input device, or "system" for what the Mac plays
   lampster.py monitor [BPM]               # live browser view of the audio analysis, with keys to mark what you hear
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
@@ -22,7 +23,9 @@ import json
 import math
 import os
 import random
+import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from collections import deque
@@ -218,15 +221,70 @@ def fold_tempo(energies, block_rate):
     return bpm
 
 
+SYSTEM_AUDIO = "system"  # LAMPSTER_AUDIO_INPUT value that taps the Mac's own output instead of an input device
+TAP_SOURCE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "systap.swift")
+TAP_BINARY = os.path.expanduser("~/.cache/lampster-ctl/systap")
+
+
+class SystemTap:
+    """What the Mac is playing, tapped by systap.swift (Core Audio process tap, macOS 14.2+), with the same
+    `with` and callback shape as sd.InputStream so the analysis does not care where its samples come from."""
+
+    def __init__(self):
+        import numpy as np
+
+        self.np = np
+        if not os.path.exists(TAP_BINARY) or os.path.getmtime(TAP_BINARY) < os.path.getmtime(TAP_SOURCE):
+            os.makedirs(os.path.dirname(TAP_BINARY), exist_ok=True)
+            subprocess.run(["swiftc", "-swift-version", "5", "-O", TAP_SOURCE, "-o", TAP_BINARY], check=True)
+        self.proc = subprocess.Popen([TAP_BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        line = self.proc.stderr.readline().decode()
+        if not line.startswith("rate="):
+            self.proc.kill()
+            sys.exit(f"system audio tap failed: {(line + self.proc.stderr.read().decode()).strip()}")
+        self.rate = float(line.split()[0].removeprefix("rate="))
+
+    def stream(self, blocksize, callback):
+        self.blocksize, self.callback = blocksize, callback
+        return self
+
+    def __enter__(self):
+        threading.Thread(target=self.pump, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.terminate()
+        self.proc.wait()
+
+    def pump(self):
+        while True:
+            data = self.proc.stdout.read(self.blocksize * 4)  # float32 mono
+            if len(data) < self.blocksize * 4:
+                return
+            block = self.np.frombuffer(data, dtype=self.np.float32).reshape(-1, 1)
+            self.callback(block, self.blocksize, None, None)
+
+
+def open_audio(device):
+    """(sample rate, stream factory taking blocksize and callback) for LAMPSTER_AUDIO_INPUT."""
+    if device == SYSTEM_AUDIO:
+        tap = SystemTap()
+        return tap.rate, tap.stream
+    import sounddevice as sd
+
+    rate = sd.query_devices(device, "input")["default_samplerate"]
+    return rate, lambda blocksize, callback: sd.InputStream(
+        device=device, channels=1, samplerate=rate, blocksize=blocksize, callback=callback
+    )
+
+
 async def reactive(c, args):
     """Flash a new colour on each bass beat. When the kick drops out and the highs climb (a riser) the whites
     swell and pulse, and the kick coming back is answered by one full flash."""
     import numpy as np
-    import sounddevice as sd
 
     seconds = float(args[0]) if args else None
-    device = os.environ.get("LAMPSTER_AUDIO_INPUT")
-    rate = sd.query_devices(device, "input")["default_samplerate"]
+    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT"))
     size = 2048
     window = np.hanning(size)
     bins = {name: slice(*(int(hz * size / rate) for hz in span)) for name, span in (("bass", BASS_HZ), ("high", HIGH_HZ))}
@@ -260,7 +318,7 @@ async def reactive(c, args):
             hue = (hue + random.uniform(0.2, 0.6)) % 1
 
     t0 = time.monotonic()
-    with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=1024, callback=hear):
+    with listen(1024, hear):
         while seconds is None or time.monotonic() - t0 < seconds:
             blocks, heard[:] = heard[:], []
             now = time.monotonic()
@@ -410,11 +468,9 @@ async def monitor(args):
     """Serve a live browser view of the audio analysis: spectrum bands, novelty against the last 8 bars,
     kicks and tempo. Keys in the page drop timestamped marks into lampster-marks.jsonl."""
     import numpy as np
-    import sounddevice as sd
 
     bpm_hint = float(args[0]) if args else PRIOR_BPM
-    device = os.environ.get("LAMPSTER_AUDIO_INPUT")
-    rate = sd.query_devices(device, "input")["default_samplerate"]
+    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT"))
     size, hop = 2048, 1024
     window = np.hanning(size)
     freqs = np.fft.rfftfreq(size, 1 / rate)
@@ -462,7 +518,7 @@ async def monitor(args):
     bar = 4 * 60 / bpm_hint
     bass_avg, peak, last_kick, last_tempo, bpm = None, 0.0, 0.0, 0.0, None
     t0 = time.monotonic()
-    with sd.InputStream(device=device, channels=1, samplerate=rate, blocksize=hop, callback=hear), open("lampster-marks.jsonl", "a") as marks_file:
+    with listen(hop, hear), open("lampster-marks.jsonl", "a") as marks_file:
         while True:
             await asyncio.sleep(0.1)
             now = time.monotonic()

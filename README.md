@@ -32,11 +32,13 @@ LAMPSTER_LAT=48.86 LAMPSTER_LON=2.35 ./lampster.py sun
 
 ## Reactive mode
 
-`./lampster.py reactive [SECONDS]` listens to an audio input and flashes a new colour on every bass beat, then lets the light decay until the next one. It uses the system's default input (the microphone), so it works for any room with music in it. For a clean digital signal, route the computer's output to a loopback device such as [BlackHole](https://existential.audio/blackhole/) through a Multi-Output Device in Audio MIDI Setup, and name it:
+`./lampster.py reactive [SECONDS]` listens to an audio input and flashes a new colour on every bass beat, then lets the light decay until the next one. It uses the system's default input (the microphone), so it works for any room with music in it. For a clean digital signal with nothing to reroute, tap what the Mac is playing (macOS 14.2+, needs Xcode's command line tools for `swiftc`):
 
 ```bash
-LAMPSTER_AUDIO_INPUT=BlackHole ./lampster.py reactive
+LAMPSTER_AUDIO_INPUT=system ./lampster.py reactive
 ```
+
+`systap.swift` is a small Core Audio process tap that writes the system output as mono samples; `lampster.py` compiles it once into `~/.cache/lampster-ctl/` and the microphone stays free for dictation. Your output device and volume are untouched, and the first run may ask the terminal for system audio permission. `monitor` accepts it too. The older route also works: send the output to a loopback device such as [BlackHole](https://existential.audio/blackhole/) through a Multi-Output Device in Audio MIDI Setup, and name it with `LAMPSTER_AUDIO_INPUT=BlackHole`.
 
 The beat detector looks at 30-150 Hz energy against its own running average (`BASS_HZ`, `BEAT_RATIO`, `SILENCE` at the top of the script). A kick must reach a share of the track's own recent peak, so the system volume does not matter. When the kick drops out and the highs start climbing (a riser), the whites swell and pulse, capped at 3 flashes per second, then a single full flash lands when the kick returns. The lamp's beat is not every kick: the tempo is estimated from the bass (autocorrelation over the last 10 seconds) and folded into a dance range (`DANCE_BPM`, 82-165), the way people hear it. Music that reads faster is danced at half speed, so extra kicks are skipped; music that reads slower is danced at double speed, so beats are added in between. Every `WHITE_EVERY`-th beat (default 4, one bar) is white and the rest are new colours, each a spike that decays at `DECAY` per update. When the music stops, the lamp fades to 5% over 5 seconds. Laptop speakers have little bass, so with a microphone you may need to lower `SILENCE`. The terminal needs microphone permission the first time. Like disco, it needs `uv` to fetch `numpy` and `sounddevice`.
 
