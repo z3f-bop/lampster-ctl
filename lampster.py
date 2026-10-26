@@ -5,8 +5,9 @@
 # ///
 """Control The Lampster over Bluetooth LE.
 
+  lampster.py version          # print the version (also --version)
   lampster.py status
-  lampster.py color R G B      # 0-255 each, or a single #rrggbb
+  lampster.py color R G B     # 0-255 each, or a single #rrggbb
   lampster.py white WARM COOL  # 0-100 each
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
@@ -34,6 +35,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
+VERSION = "0.1.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -577,6 +579,8 @@ async def run(c, argv):
 
 
 async def main(argv):
+    if argv in (["version"], ["--version"]):
+        return print(f"lampster-ctl {VERSION}")
     if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive", "monitor"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
