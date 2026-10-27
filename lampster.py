@@ -15,6 +15,8 @@
                                           # LAMPSTER_AUDIO_INPUT=name part of an input device, or "system" for what the Mac plays
   lampster.py monitor [BPM]               # live browser view of the audio analysis, with keys to mark what you hear
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
+  lampster.py hue [PERIOD [SECONDS]]      # rotate the hue of the lit color through 360 degrees every PERIOD seconds
+                                          # (default 60), whites untouched; runs until SECONDS (default: stopped)
   lampster.py sun [SPEED [HH:MM]]         # follow the sun and moon; SPEED>1 plays one day from HH:MM (default now)
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
 """
@@ -35,7 +37,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -123,6 +125,21 @@ async def fade(c, seconds, target):
     await c.write_gatt_char(COLOR, bytes(target), response=False)
     await c.write_gatt_char(WHITE, bytes([0, 0]), response=True)
     await c.write_gatt_char(MODE, bytes([MODES["color"] | keep]), response=True)
+
+
+async def hue(c, args):
+    """Rotate the hue of the color now lit through a full circle every PERIOD seconds; saturation, value and whites stay."""
+    period = float(args[0]) if args else 60.0
+    seconds = float(args[1]) if len(args) > 1 else math.inf
+    mode = (await c.read_gatt_char(MODE))[0]
+    rgb = list(await c.read_gatt_char(COLOR))
+    h0, s, v = colorsys.rgb_to_hsv(*(x / 100 for x in rgb)) if any(rgb) else (0.0, 1.0, 1.0)
+    await c.write_gatt_char(MODE, bytes([mode | COLOR_BANK]), response=True)
+    t0 = time.monotonic()
+    while (elapsed := time.monotonic() - t0) < seconds:
+        levels = [round(x * 100) for x in colorsys.hsv_to_rgb((h0 + elapsed / period) % 1, s, v)]
+        await c.write_gatt_char(COLOR, bytes(levels), response=False)
+        await asyncio.sleep(FADE_STEP)
 
 
 def _days(when):
@@ -565,6 +582,8 @@ async def run(c, argv):
         await reactive(c, argv[1:])
     elif argv[0] == "disco":
         await disco(c, argv[1:])
+    elif argv[0] == "hue":
+        await hue(c, argv[1:])
     elif argv[0] == "sun":
         await sun(c, argv[1:])
     elif argv[0] == "color":
@@ -581,7 +600,7 @@ async def run(c, argv):
 async def main(argv):
     if argv in (["version"], ["--version"]):
         return print(f"lampster-ctl {VERSION}")
-    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "sun", "disco", "reactive", "monitor"):
+    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "hue", "sun", "disco", "reactive", "monitor"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
@@ -589,7 +608,7 @@ async def main(argv):
         sys.exit("sun needs LAMPSTER_LAT and LAMPSTER_LON in the environment (degrees, east positive)")
     if argv[0] == "monitor":
         return await monitor(argv[1:])
-    long_running, drops = argv[0] in ("sun", "disco", "reactive"), 0
+    long_running, drops = argv[0] in ("hue", "sun", "disco", "reactive"), 0
     while True:
         lamp = await BleakScanner.find_device_by_name(NAME, timeout=15)
         if lamp is None and not drops:

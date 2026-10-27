@@ -26,6 +26,8 @@ LAMPSTER_LAT=48.86 LAMPSTER_LON=2.35 ./lampster.py sun
 
 ## Disco mode
 
+`./lampster.py hue [PERIOD [SECONDS]]` rotates the hue of the lit colour through a full circle every PERIOD seconds (default 60), starting from the colour on the lamp, at the same saturation and brightness. The whites are not touched, so a warm white keeps its level underneath. It runs until stopped, or for SECONDS.
+
 `./lampster.py disco [BPM [SECONDS]]` (default 128 BPM, runs until stopped) changes to a new vivid colour on every beat. At the end of some 8-beat phrases it fires a short white strobe burst.
 
 **Photosensitivity:** strobing can trigger seizures in people with photosensitive epilepsy. The burst is held to 3 flashes per second, the common guideline ceiling, and `STROBE_HZ` is a constant you should leave there, especially with guests around. Set `STROBE_CHANCE` to 0 for no strobes at all.
@@ -50,7 +52,7 @@ Keys in the page: **space** taps tempo (the page shows how far the detector is f
 
 ## Good to know
 
-- The lamp talks to one device at a time. Force-quit the phone app before running anything here, and note that a running `fade` or `sun` holds the connection, so the app cannot connect until you stop it.
+- The lamp talks to one device at a time. Force-quit the phone app before running anything here, and note that a running `fade`, `hue` or `sun` holds the connection, so the app cannot connect until you stop it.
 - The lamp has no pairing or authentication: anyone within Bluetooth range can control it.
 - The wake-up and off timers in the app are not exposed over the registers read here; they appear to live in the app.
 - Everything here was worked out on one lamp. If yours behaves differently (other firmware, other UUIDs), open an issue with the output of `status` and your lamp's GATT table.
