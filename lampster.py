@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -73,6 +73,7 @@ DROP_FLASH = 0.15  # seconds of full light when the kick returns after a riser
 SILENCE = 0.3  # energy below this is not a beat
 DECAY = 0.7  # brightness kept per update after a beat; lower is spikier
 FLOOR = 0.06  # dimmest the lamp gets between beats
+BRIGHTNESS = min(100.0, max(5.0, float(os.environ.get("LAMPSTER_BRIGHTNESS", "100")))) / 100  # share of full light that disco and reactive may use
 SUN_TICK = 30  # seconds between sun updates at real-time speed
 # (solar elevation deg, R, G, B, warm, cool): red at the horizon, white warming up and cooling by noon, dark by -12
 MOON_LEVELS = (0, 0, 8, 0, 12)  # [R, G, B, warm, cool] a full moon at the zenith adds: faint cool blue-white
@@ -297,6 +298,11 @@ def open_audio(device):
     )
 
 
+def dimmed(levels):
+    """Scale 0-100 channel levels by BRIGHTNESS."""
+    return bytes(round(v * BRIGHTNESS) for v in levels)
+
+
 async def reactive(c, args):
     """Flash a new colour on each bass beat. When the kick drops out and the highs climb (a riser) the whites
     swell and pulse, and the kick coming back is answered by one full flash."""
@@ -392,6 +398,7 @@ async def reactive(c, args):
                 out = (bytes(3), bytes([round(30 * level), round(100 * level)]))  # crisp white: a little warm under the cool
             else:
                 out = (bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, level)), bytes(2))
+            out = (dimmed(out[0]), dimmed(out[1]))
             if out != last_sent:
                 await c.write_gatt_char(COLOR, out[0], response=False)
                 if last_sent is None or out[1] != last_sent[1]:
@@ -418,12 +425,12 @@ async def disco(c, args):
         if n % 8 == 7 and random.random() < STROBE_CHANCE:
             for _ in range(4):
                 for level in (100, 0):
-                    await c.write_gatt_char(COLOR, bytes([level] * 3), response=False)
+                    await c.write_gatt_char(COLOR, dimmed([level] * 3), response=False)
                     await asyncio.sleep(1 / (2 * STROBE_HZ))
             n = max(n + 1, math.ceil((time.monotonic() - t0) / beat))
         else:
             hue = (hue + random.uniform(0.2, 0.6)) % 1
-            await c.write_gatt_char(COLOR, bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, 1)), response=False)
+            await c.write_gatt_char(COLOR, dimmed(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, 1)), response=False)
             n += 1
         await asyncio.sleep(max(0, t0 + n * beat - time.monotonic()))
 
