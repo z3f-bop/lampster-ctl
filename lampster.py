@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -65,7 +65,7 @@ RISER_RATIO = 1.3  # highs this far above their slow average, with no kick for a
 RISER_SECONDS = 8  # how long the whites take to swell to full
 RISER_TIMEOUT = 24
 WHITE_EVERY = 4 # every Nth kick is white instead of a colour; 0 for colours only
-MONITOR_PORT = 8787
+MONITOR_PORT = int(os.environ.get("LAMPSTER_MONITOR_PORT", "8787"))  # override when 8787 is taken by another local service
 CHANGE_NOVELTY = 0.2  # the last bar this far from the last 8 bars' average counts as a change in the groove
 QUIET_LEVEL = 0.05  # brightness the lamp settles to once the music stops
 QUIET_FADE = 5  # seconds it takes to get there, starting half a second after the last sound

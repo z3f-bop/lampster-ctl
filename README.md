@@ -46,7 +46,7 @@ The beat detector looks at 30-150 Hz energy against its own running average (`BA
 
 ## Monitor
 
-`./lampster.py monitor [BPM]` opens a live page at `http://localhost:8787` (it never touches the lamp) showing the audio analysis as the track plays: low and high band levels, kicks, the folded tempo, and **novelty**, how far the last bar's spectrum is from the average of the last 8 bars. Steady four-on-the-floor sits near 0.05; a breakdown, a new element or a build lifts it above 0.2, which is where the page shows CHANGE.
+`./lampster.py monitor [BPM]` opens a live page at `http://localhost:8787` (set `LAMPSTER_MONITOR_PORT` if another service holds that port; it never touches the lamp) showing the audio analysis as the track plays: low and high band levels, kicks, the folded tempo, and **novelty**, how far the last bar's spectrum is from the average of the last 8 bars. Steady four-on-the-floor sits near 0.05; a breakdown, a new element or a build lifts it above 0.2, which is where the page shows CHANGE.
 
 Keys in the page: **space** taps tempo (the page shows how far the detector is from your tap, and your tap sets the bar length for the novelty measure; **x** clears it), and **c**, **b**, **d** mark a change, a build or a drop at that moment. Marks go to `lampster-marks.jsonl` in the directory you ran it from, so you can compare what you heard with what the numbers did. The novelty measure is not used by `reactive` yet.
 
