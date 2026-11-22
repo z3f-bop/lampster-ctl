@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -569,7 +569,7 @@ async def monitor(args):
             label = pending_marks.pop(0) if pending_marks else None
             frame = {"t": now - t0, "novelty": float(np.abs(short - long).sum() / max(long.sum(), 1e-9)),
                      "low": float(short[:3].mean()), "high": float(short[7:].mean()), "kick": kick, "bpm": bpm,
-                     "threshold": CHANGE_NOVELTY, "mark": label}
+                     "threshold": CHANGE_NOVELTY, "mark": label, "tap": state["tap"]}
             if label:
                 marks_file.write(json.dumps({"t": round(frame["t"], 2), "label": label, "novelty": round(frame["novelty"], 3)}) + "\n")
                 marks_file.flush()
