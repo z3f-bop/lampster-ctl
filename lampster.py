@@ -46,7 +46,7 @@ from lampster_ctl.config import (
     AUDIO_BACKLOG, AUDIO_FPS, BLOCK, BRIGHTNESS, CHANGE_NOVELTY, PRIOR_BPM, STROBE_CHANCE, STROBE_HZ,
 )
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -291,10 +291,11 @@ button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--gr
 <div><div class=dim>groove</div><div class=big id=state>--</div></div></div>
 <canvas id=c width=2400 height=840></canvas>
 <div class=row style="margin-top:10px"><button onclick="tap()">Tap tempo <span class=key>[space]</span></button>
+<button onclick="mark('one')">The one <span class=key>[1]</span></button>
 <button onclick="mark('change')">Change <span class=key>[c]</span></button>
 <button onclick="mark('build')">Build <span class=key>[b]</span></button>
 <button onclick="mark('drop')">Drop <span class=key>[d]</span></button>
-<span class=dim>Tap the beat with space (x clears). Mark what you hear. Marks are saved to lampster-marks.jsonl. White: novelty. Blue: low band. Orange: high band. Grey ticks: kicks. Green line: how bright the lamp is. Green ticks: lamp beats. Orange shading: a riser. The lamp tempo and every tick come from the same code the lamp runs.</span></div>
+<span class=dim>Tap the beat with space (x clears). Press 1 on every downbeat, the one of the bar. Mark what you hear. Marks are saved to lampster-marks.jsonl. White: novelty. Blue: low band. Orange: high band. Grey ticks: kicks. Green line: how bright the lamp is. Green ticks: lamp beats. Orange shading: a riser. The lamp tempo and every tick come from the same code the lamp runs.</span></div>
 </main>
 <script>
 const SPAN=120,frames=[],marks=[],c=document.getElementById('c'),x=c.getContext('2d');
@@ -305,7 +306,7 @@ function tap(){const n=performance.now();if(taps.length&&n-taps[taps.length-1]>2
  if(taps.length>1){tapBpm=60000/((taps[taps.length-1]-taps[0])/(taps.length-1));fetch('/tempo?bpm='+tapBpm.toFixed(2),{method:'POST'})}show()}
 function show(){document.getElementById('tap').textContent=tapBpm?tapBpm.toFixed(1):'--';
  document.getElementById('diff').textContent=tapBpm&&detected?'detector '+(detected>tapBpm?'+':'')+(detected-tapBpm).toFixed(1)+' BPM off':'tap the beat'}
-addEventListener('keydown',e=>{if(e.repeat)return;if(e.key===' '){e.preventDefault();tap()}else if(e.key==='c')mark('change');else if(e.key==='b')mark('build');else if(e.key==='d')mark('drop');else if(e.key==='x'){taps=[];tapBpm=null;fetch('/tempo?bpm=0',{method:'POST'});show()}});
+addEventListener('keydown',e=>{if(e.repeat)return;if(e.key===' '){e.preventDefault();tap()}else if(e.key==='1')mark('one');else if(e.key==='c')mark('change');else if(e.key==='b')mark('build');else if(e.key==='d')mark('drop');else if(e.key==='x'){taps=[];tapBpm=null;fetch('/tempo?bpm=0',{method:'POST'});show()}});
 const es=new EventSource('/events');
 es.onmessage=m=>{const f=JSON.parse(m.data);frames.push(f);if(f.mark)marks.push({t:f.t,label:f.mark});
  while(frames.length&&frames[0].t<f.t-SPAN)frames.shift();
@@ -371,8 +372,8 @@ async def monitor(args):
     short = long = None
     bar = 4 * 60 / bpm_hint
     seen = dict.fromkeys(("kick", "hit"), False)  # events since the last frame sent to the page
-    t0 = last_sent = time.monotonic()
     with listen(BLOCK, hear), open("lampster-marks.jsonl", "a") as marks_file:
+        t0 = last_sent = time.monotonic()  # marks are timed from here, the first audio block, so they line up with a recording made in this run
         while True:
             await asyncio.sleep(1 / AUDIO_FPS)  # the lamp's own tick, so the Brain behaves exactly as it does on the lamp
             now = time.monotonic()
