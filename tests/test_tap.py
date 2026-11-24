@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-import lampster
+from lampster_ctl import audio
 
 FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_tap.py")
 
@@ -22,14 +22,14 @@ def wait_until(condition, timeout=8.0):
 @pytest.fixture
 def make_tap(tmp_path, monkeypatch):
     taps, counter = [], tmp_path / "spawns"
-    monkeypatch.setattr(lampster.SystemTap, "STALL", 0.6)
-    monkeypatch.setattr(lampster.SystemTap, "PAUSES", (0.1, 0.1, 0.1))
+    monkeypatch.setattr(audio.SystemTap, "STALL", 0.6)
+    monkeypatch.setattr(audio.SystemTap, "PAUSES", (0.1, 0.1, 0.1))
     monkeypatch.setenv("FAKE_TAP_COUNTER", str(counter))
 
     def make(modes="steady", rates="48000"):
         monkeypatch.setenv("FAKE_TAP_MODES", modes)
         monkeypatch.setenv("FAKE_TAP_RATES", rates)
-        tap = lampster.SystemTap(binary=FAKE)
+        tap = audio.SystemTap(binary=FAKE)
         taps.append(tap)
         return tap
 
@@ -131,7 +131,7 @@ def test_open_audio_reuses_one_system_tap(monkeypatch):
             return self
 
     stub = Stub()
-    monkeypatch.setattr(lampster, "_system_tap", stub)
-    assert lampster.open_audio("system") == (48000.0, stub.stream)
-    assert lampster.open_audio("system") == (48000.0, stub.stream)  # a reconnect asks again...
-    assert lampster._system_tap is stub  # ...and never builds a second tap
+    monkeypatch.setattr(audio, "_system_tap", stub)
+    assert audio.open_audio("system") == (48000.0, stub.stream)
+    assert audio.open_audio("system") == (48000.0, stub.stream)  # a reconnect asks again...
+    assert audio._system_tap is stub  # ...and never builds a second tap

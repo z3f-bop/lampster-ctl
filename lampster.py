@@ -14,7 +14,9 @@
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
   lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers
                                           # LAMPSTER_AUDIO_INPUT=name part of an input device; the default is "system", what the Mac plays
-  lampster.py monitor [BPM]               # live browser view of the audio analysis, with keys to mark what you hear
+  lampster.py monitor [BPM]               # live browser view of what the lamp hears and does, with keys to mark what you hear
+                                          # LAMPSTER_RECORD=file also records the tapped audio, for replay
+  lampster.py replay FILE [TAPPED_BPM]    # run a recording through the lamp's analysis offline, no lamp needed
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py hue [PERIOD [SECONDS]]      # rotate the hue of the lit color through 360 degrees every PERIOD seconds
                                           # (default 60), whites untouched; runs until SECONDS (default: stopped)
@@ -22,18 +24,14 @@
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
 """
 import asyncio
-import atexit
 import colorsys
 import contextlib
 import json
 import math
 import os
 import random
-import select
 import signal
-import subprocess
 import sys
-import threading
 import time
 import webbrowser
 from collections import deque
@@ -42,7 +40,13 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.7.0"
+from lampster_ctl.analysis import Brain, Spectrum, simulate
+from lampster_ctl.audio import SYSTEM_AUDIO, open_audio
+from lampster_ctl.config import (
+    AUDIO_BACKLOG, AUDIO_FPS, BLOCK, BRIGHTNESS, CHANGE_NOVELTY, PRIOR_BPM, STROBE_CHANCE, STROBE_HZ,
+)
+
+VERSION = "0.8.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -51,35 +55,7 @@ LEAVING_ROOM = 0x10  # app's "turn off when leaving room" flag, kept across mode
 WHITE_BANK, COLOR_BANK = 0x40, 0x20  # bank bits of the mode byte
 FADE_STEP = 0.25  # seconds between fade writes
 LAT, LON = (float(os.environ.get(k, "nan")) for k in ("LAMPSTER_LAT", "LAMPSTER_LON"))  # degrees, east positive
-STROBE_HZ = 3  # flashes per second, at the photosensitivity guideline limit; never raise this
-STROBE_CHANCE = 0.3  # per 8-beat phrase
-AUDIO_FPS = 40  # lamp updates per second in reactive mode
-AUDIO_BACKLOG = 5  # seconds of analysed audio kept if the lamp loop stalls; older blocks are dropped
-BASS_HZ = (30, 150)  # band whose energy marks a beat
-BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
-MIN_BEAT_GAP = 0.15  # seconds between raw kick detections
-DANCE_BPM = (82, 165)  # the range people move to (hard techno stays at full speed, drum and bass halves): faster is danced at half speed, slower at double
-PRIOR_BPM = 110  # tempo people find most natural, used to break ties between octaves
-TEMPO_WINDOW = 10  # seconds of bass history the tempo estimate looks at
-TEMPO_SMOOTH = 0.08  # share of each new estimate taken per second, so the tempo drifts instead of jumping
-TEMPO_JUMP = 0.12  # an estimate this far from the smoothed tempo...
-TEMPO_SNAP = 5  # ...for this many seconds in a row is a new track, and the tempo snaps to it
-HIGH_HZ = (2000, 8000)  # band whose climb marks a riser
-KICK_SHARE = 0.3  # a kick must also reach this share of the recent peak, so volume does not matter
-PEAK_DECAY = 0.999  # per audio block; the recent peak halves in about 16 s
-RISER_RATIO = 1.3  # highs this far above their slow average, with no kick for a second, start a riser
-RISER_SECONDS = 8  # how long the whites take to swell to full
-RISER_TIMEOUT = 24
-WHITE_EVERY = 4 # every Nth kick is white instead of a colour; 0 for colours only
 MONITOR_PORT = int(os.environ.get("LAMPSTER_MONITOR_PORT", "8787"))  # override when 8787 is taken by another local service
-CHANGE_NOVELTY = 0.2  # the last bar this far from the last 8 bars' average counts as a change in the groove
-QUIET_LEVEL = 0.05  # brightness the lamp settles to once the music stops
-QUIET_FADE = 5  # seconds it takes to get there, starting half a second after the last sound
-DROP_FLASH = 0.15  # seconds of full light when the kick returns after a riser
-SILENCE = 0.3  # energy below this is not a beat
-DECAY = 0.7  # brightness kept per update after a beat; lower is spikier
-FLOOR = 0.06  # dimmest the lamp gets between beats
-BRIGHTNESS = min(100.0, max(5.0, float(os.environ.get("LAMPSTER_BRIGHTNESS", "100")))) / 100  # share of full light that disco and reactive may use
 SUN_TICK = 30  # seconds between sun updates at real-time speed
 # (solar elevation deg, R, G, B, warm, cool): red at the horizon, white warming up and cooling by noon, dark by -12
 MOON_LEVELS = (0, 0, 8, 0, 12)  # [R, G, B, warm, cool] a full moon at the zenith adds: faint cool blue-white
@@ -228,190 +204,6 @@ async def sun(c, args):
         await asyncio.sleep(max(0.5, SUN_TICK / speed))
 
 
-def fold_tempo(energies, block_rate):
-    """Tempo from the autocorrelation of the bass onsets, folded into DANCE_BPM."""
-    import numpy as np
-
-    flux = np.maximum(0, np.diff(np.asarray(energies)))
-    flux = flux - flux.mean()
-    ac = np.maximum(0, np.correlate(flux, flux, "full")[len(flux) - 1:])
-    lags = np.arange(int(block_rate * 60 / 200), min(len(ac), int(block_rate * 60 / 55)))
-    if len(lags) == 0 or ac[0] <= 0:
-        return None
-    bpms = 60 * block_rate / lags
-    bpm = float(bpms[np.argmax(ac[lags] * np.exp(-0.5 * (np.log2(bpms / PRIOR_BPM) / 0.6) ** 2))])
-    while bpm < DANCE_BPM[0]:
-        bpm *= 2
-    while bpm >= DANCE_BPM[1]:
-        bpm /= 2
-    return bpm
-
-
-SYSTEM_AUDIO = "system"  # LAMPSTER_AUDIO_INPUT value that taps the Mac's own output instead of an input device
-TAP_SOURCE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "systap.swift")
-TAP_BINARY = os.environ.get("LAMPSTER_TAP_BINARY") or os.path.expanduser("~/.cache/lampster-ctl/systap")
-
-
-def log(message):
-    print(f"lampster: {message}", file=sys.stderr, flush=True)
-
-
-class SystemTap:
-    """What the Mac is playing, tapped by systap.swift (Core Audio process tap, macOS 14.2+), with the same
-    `with` and callback shape as sd.InputStream so the analysis does not care where its samples come from.
-
-    One tap serves the whole process: a lamp reconnect re-enters the analysis but reuses this object, so a second
-    tap is never opened. A supervisor thread restarts the child when it exits or stops delivering audio, pausing
-    longer after each quick failure, and the child exits by itself when this process is gone."""
-
-    STALL = 3.0  # seconds without a byte before the tap counts as stuck
-    PAUSES = (0.5, 1, 2, 5, 10, 30)  # seconds before the next restart, growing while restarts keep failing
-    HEALTHY = 10.0  # a tap that ran this long starts the pauses over
-
-    def __init__(self, binary=None):
-        import numpy as np
-
-        self.np, self.binary = np, binary or TAP_BINARY
-        self.callback = self.pending = self.proc = self.thread = None
-        self.blocksize, self.restarts, self.closed = 1024, 0, threading.Event()
-        if binary is None and (not os.path.exists(TAP_BINARY) or os.path.getmtime(TAP_BINARY) < os.path.getmtime(TAP_SOURCE)):
-            os.makedirs(os.path.dirname(TAP_BINARY), exist_ok=True)
-            subprocess.run(["swiftc", "-swift-version", "5", "-O", TAP_SOURCE, "-o", TAP_BINARY], check=True)
-        try:
-            self.rate = self.source_rate = self.spawn()
-        except RuntimeError as error:
-            sys.exit(str(error))
-        atexit.register(self.close)
-
-    def spawn(self):
-        """Start the child and return its sample rate. stdin stays open: its end of file is the child's cue to exit."""
-        proc = subprocess.Popen([self.binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        line = proc.stderr.readline().decode() if select.select([proc.stderr], [], [], 15)[0] else ""
-        if not line.startswith("rate="):
-            proc.kill()
-            proc.wait()
-            raise RuntimeError(f"system audio tap failed: {(line + proc.stderr.read().decode()).strip()}")
-        self.proc = proc
-        threading.Thread(target=self.relay, args=(proc,), daemon=True).start()
-        return float(line.split()[0].removeprefix("rate="))
-
-    def relay(self, proc):
-        for line in proc.stderr:
-            log(f"tap: {line.decode().strip()}")
-
-    def stream(self, blocksize, callback):
-        self.pending = (blocksize, callback)
-        return self
-
-    def __enter__(self):
-        self.blocksize, self.callback = self.pending
-        if self.thread is None:
-            self.thread = threading.Thread(target=self.supervise, daemon=True)
-            self.thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.callback = None  # the tap keeps running for the next analysis
-
-    def close(self):
-        self.closed.set()
-        self.stop(self.proc)
-
-    @staticmethod
-    def stop(proc):
-        if proc is None:
-            return
-        with contextlib.suppress(OSError):
-            proc.stdin.close()  # end of file on stdin makes the child clean up and exit
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-    def supervise(self):
-        failures = 0
-        while not self.closed.is_set():
-            started = time.monotonic()
-            reason = self.pump(self.proc)
-            if self.closed.is_set():
-                return
-            self.stop(self.proc)
-            failures = 0 if time.monotonic() - started >= self.HEALTHY else failures + 1
-            self.restarts += 1
-            log(f"audio tap {reason} after {time.monotonic() - started:.0f}s, restart {self.restarts}")
-            while not self.closed.wait(self.PAUSES[min(failures, len(self.PAUSES) - 1)]):
-                try:
-                    self.source_rate = self.spawn()
-                    break
-                except RuntimeError as error:
-                    failures += 1
-                    log(str(error))
-
-    def need(self):
-        """Bytes of float32 mono that make one block, at the child's rate."""
-        return round(self.blocksize * self.source_rate / self.rate) * 4
-
-    def pump(self, proc):
-        """Deliver blocks until the child exits or goes quiet; returns why."""
-        fd, buf, last = proc.stdout.fileno(), bytearray(), time.monotonic()
-        while not self.closed.is_set():
-            if select.select([fd], [], [], 0.5)[0]:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    return "exited"
-                buf += chunk
-                last = time.monotonic()
-                while len(buf) >= self.need():
-                    size = self.need()
-                    self.deliver(bytes(buf[:size]))
-                    del buf[:size]
-            elif proc.poll() is not None:
-                return "exited"
-            elif time.monotonic() - last > self.STALL:
-                return "stalled"
-        return "closed"
-
-    def deliver(self, data):
-        callback = self.callback
-        if callback is None:
-            return
-        block = self.np.frombuffer(data, dtype=self.np.float32)
-        if self.source_rate != self.rate:  # the output device changed rate: resample to the rate the analysis was built for
-            block = self.np.interp(self.np.linspace(0, len(block) - 1, self.blocksize), self.np.arange(len(block)), block).astype(self.np.float32)
-        try:
-            callback(block.reshape(-1, 1), self.blocksize, None, None)
-        except Exception as error:  # a bad block must not end the audio
-            log(f"analysis callback failed: {error!r}")
-
-
-class DeviceAudio:
-    """An input device (the microphone, BlackHole), through sounddevice."""
-
-    def __init__(self, device):
-        import sounddevice as sd
-
-        self.sd, self.device = sd, device
-        self.rate = sd.query_devices(device, "input")["default_samplerate"]
-
-    def stream(self, blocksize, callback):
-        return self.sd.InputStream(device=self.device, channels=1, samplerate=self.rate, blocksize=blocksize, callback=callback)
-
-
-_system_tap = None
-
-
-def open_audio(device):
-    """(sample rate, stream factory taking blocksize and callback) for LAMPSTER_AUDIO_INPUT."""
-    global _system_tap
-    if device == SYSTEM_AUDIO:
-        if _system_tap is None or _system_tap.closed.is_set():
-            _system_tap = SystemTap()
-        return _system_tap.rate, _system_tap.stream
-    audio = DeviceAudio(device)
-    return audio.rate, audio.stream
-
-
 def dimmed(levels):
     """Scale 0-100 channel levels by BRIGHTNESS."""
     return bytes(round(v * BRIGHTNESS) for v in levels)
@@ -419,100 +211,28 @@ def dimmed(levels):
 
 async def reactive(c, args):
     """Flash a new colour on each bass beat. When the kick drops out and the highs climb (a riser) the whites
-    swell and pulse, and the kick coming back is answered by one full flash."""
-    import numpy as np
-
+    swell and pulse, and the kick coming back is answered by one full flash. What it hears and decides lives in
+    lampster_ctl.analysis; this only writes the result to the lamp."""
     seconds = float(args[0]) if args else None
     rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT", SYSTEM_AUDIO))
-    size = 2048
-    window = np.hanning(size)
-    bins = {name: slice(*(int(hz * size / rate) for hz in span)) for name, span in (("bass", BASS_HZ), ("high", HIGH_HZ))}
-    ring = np.zeros(size, dtype=np.float32)
-    heard = deque(maxlen=int(rate / 1024 * AUDIO_BACKLOG))  # if the lamp stalls, the oldest blocks fall off
+    spectrum, brain = Spectrum(rate), Brain(rate)
+    heard = deque(maxlen=int(rate / BLOCK * AUDIO_BACKLOG))  # if the lamp stalls, the oldest blocks fall off
 
     def hear(indata, frames, time_info, status):
-        nonlocal ring
-        ring = np.concatenate([ring[frames:], indata[:, 0]])
-        spectrum = np.abs(np.fft.rfft(ring * window))
-        heard.append(tuple(float(np.sqrt(np.mean(spectrum[bins[n]] ** 2))) for n in ("bass", "high")))
+        features = spectrum(indata[:, 0])
+        heard.append((features.bass, features.high))
 
     keep = (await c.read_gatt_char(MODE))[0] & LEAVING_ROOM
     await c.write_gatt_char(WHITE, bytes([0, 0]), response=True)
     await c.write_gatt_char(COLOR, bytes([0, 0, 0]), response=False)
     await c.write_gatt_char(MODE, bytes([MODES["both"] | keep]), response=True)  # RGB and white banks both live
-    hue, level, last_beat, flash_until = random.random(), FLOOR, 0.0, 0.0
-    bass_avg = high_slow = high_fast = None
-    peak, riser, last_sent, quiet_since, white_hit = 0.0, None, None, None, False
-    kicks, risers, drops, refused, hits = 0, 0, 0, 0, 0
-    block_rate = rate / 1024
-    history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
-    period, last_hit, last_tempo, tempo_known, disagreed = 60 / PRIOR_BPM, 0.0, 0.0, False, 0
-
-    def hit(when):
-        """One beat of the lamp: a spike, in a new colour or (every WHITE_EVERY-th) white."""
-        nonlocal level, hue, white_hit, hits, last_hit
-        last_hit, hits, level = when, hits + 1, 1.0
-        white_hit = bool(WHITE_EVERY) and hits % WHITE_EVERY == 0
-        if not white_hit:
-            hue = (hue + random.uniform(0.2, 0.6)) % 1
-
+    last_sent, refused = None, 0
     t0 = time.monotonic()
-    with listen(1024, hear):
+    with listen(BLOCK, hear):
         while seconds is None or time.monotonic() - t0 < seconds:
             blocks = [heard.popleft() for _ in range(len(heard))]
-            now = time.monotonic()
-            for bass, high in blocks:
-                peak = max(bass, peak * PEAK_DECAY)  # follows the track's own loudness, so volume does not matter
-                if bass_avg is None:
-                    bass_avg, high_slow, high_fast = bass, high, high
-                if bass < SILENCE and high < SILENCE:
-                    quiet_since = quiet_since or now
-                else:
-                    quiet_since = None
-                history.append(bass)
-                bass_avg += (bass - bass_avg) / 43
-                high_slow += (high - high_slow) / 130
-                high_fast += (high - high_fast) / 20
-                if bass > SILENCE and bass > BEAT_RATIO * bass_avg and bass > KICK_SHARE * peak and now - last_beat > MIN_BEAT_GAP:
-                    last_beat, kicks = now, kicks + 1
-                    if riser and now - riser > 1.5:
-                        flash_until, drops = now + DROP_FLASH, drops + 1
-                    riser = None  # a kick ends any riser, with a flash only if it had built long enough
-                    if now - last_hit >= 0.75 * period:  # faster kicks than the dance tempo are skipped
-                        hit(now)
-                elif riser is None and now - last_beat > 1.0 and high > SILENCE and high_fast > RISER_RATIO * high_slow:
-                    riser, risers = now, risers + 1
-            if now - last_tempo > 1.0 and len(history) > block_rate * 4:
-                last_tempo, bpm = now, fold_tempo(history, block_rate)
-                if bpm:
-                    estimate = 60 / bpm
-                    disagreed = disagreed + 1 if abs(estimate - period) > TEMPO_JUMP * period else 0
-                    if not tempo_known or disagreed >= TEMPO_SNAP:
-                        period, tempo_known, disagreed = estimate, True, 0
-                    else:
-                        period += (estimate - period) * TEMPO_SMOOTH
-            if quiet_since and now - quiet_since > 2:
-                history.clear()  # between tracks: start the tempo over
-                tempo_known = False
-            if last_beat and quiet_since is None and not riser and now - last_beat < 2.5 and now - last_hit >= 1.1 * period:
-                hit(now)  # kicks slower than the dance tempo get the beats in between
-            if riser and (now - riser > RISER_TIMEOUT or high_fast < 0.7 * high_slow):
-                riser = None  # the build fizzled out
-            fade = 0 if quiet_since is None else min(1, max(0, (now - quiet_since - 0.5) / QUIET_FADE))
-            level = max(FLOOR + (QUIET_LEVEL - FLOOR) * fade, level * DECAY)
-            if now < flash_until:
-                out = (bytes([100] * 3), bytes([100, 100]))
-            elif riser:
-                swell = min(1.0, (now - riser) / RISER_SECONDS)
-                beat_hz = 1 / period
-                hz = min(STROBE_HZ, beat_hz * (0.5 + 3.5 * swell))  # beat-synced, ramping up, never past the cap
-                lit = int((now - riser) * hz * 2) % 2 == 0
-                out = (bytes(3), bytes([round(60 * (1 - swell)), round(100 * swell)]) if lit else bytes(2))
-            elif white_hit:
-                out = (bytes(3), bytes([round(30 * level), round(100 * level)]))  # crisp white: a little warm under the cool
-            else:
-                out = (bytes(round(v * 100) for v in colorsys.hsv_to_rgb(hue, 1, level)), bytes(2))
-            out = (dimmed(out[0]), dimmed(out[1]))
+            frame = brain.step(blocks, time.monotonic())
+            out = (dimmed(frame.rgb), dimmed(frame.white))
             if out != last_sent:
                 await c.write_gatt_char(COLOR, out[0], response=False)
                 if last_sent is None or out[1] != last_sent[1]:
@@ -522,8 +242,8 @@ async def reactive(c, args):
                         out, refused = (out[0], None), refused + 1  # lamp was busy: whites go out again next tick
                 last_sent = out
             await asyncio.sleep(1 / AUDIO_FPS)
-    print(f"{kicks} kicks, {hits} lamp beats in {time.monotonic() - t0:.0f}s at ~{60 / period:.0f} BPM, "
-          f"{risers} risers, {drops} drops, {refused} white writes refused, peak bass energy {peak:.1f}")
+    print(f"{brain.kicks} kicks, {brain.hits} lamp beats in {time.monotonic() - t0:.0f}s at ~{60 / brain.period:.0f} BPM, "
+          f"{brain.risers} risers, {brain.drops} drops, {refused} white writes refused, peak bass energy {brain.peak:.1f}")
 
 
 async def disco(c, args):
@@ -564,7 +284,8 @@ button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--gr
 .key{color:var(--dim);font-size:13px}
 </style>
 <main>
-<div class=row><div><div class=dim>tempo (folded)</div><div class=big id=bpm>--</div></div>
+<div class=row><div><div class=dim>lamp tempo</div><div class=big id=lbpm>--</div></div>
+<div><div class=dim>detector (raw)</div><div class=big id=bpm>--</div></div>
 <div><div class=dim>your tap <span class=key id=diff>tap the beat</span></div><div class=big id=tap>--</div></div>
 <div><div class=dim>novelty</div><div class=big id=nov>--</div></div>
 <div><div class=dim>groove</div><div class=big id=state>--</div></div></div>
@@ -573,7 +294,7 @@ button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--gr
 <button onclick="mark('change')">Change <span class=key>[c]</span></button>
 <button onclick="mark('build')">Build <span class=key>[b]</span></button>
 <button onclick="mark('drop')">Drop <span class=key>[d]</span></button>
-<span class=dim>Tap the beat with space (x clears). Mark what you hear. Marks are saved to lampster-marks.jsonl. White: novelty. Blue: low band. Orange: high band. Ticks: kicks.</span></div>
+<span class=dim>Tap the beat with space (x clears). Mark what you hear. Marks are saved to lampster-marks.jsonl. White: novelty. Blue: low band. Orange: high band. Grey ticks: kicks. Green line: how bright the lamp is. Green ticks: lamp beats. Orange shading: a riser. The lamp tempo and every tick come from the same code the lamp runs.</span></div>
 </main>
 <script>
 const SPAN=120,frames=[],marks=[],c=document.getElementById('c'),x=c.getContext('2d');
@@ -588,7 +309,7 @@ addEventListener('keydown',e=>{if(e.repeat)return;if(e.key===' '){e.preventDefau
 const es=new EventSource('/events');
 es.onmessage=m=>{const f=JSON.parse(m.data);frames.push(f);if(f.mark)marks.push({t:f.t,label:f.mark});
  while(frames.length&&frames[0].t<f.t-SPAN)frames.shift();
- detected=f.bpm;document.getElementById('bpm').textContent=f.bpm?f.bpm.toFixed(1):'--';show();
+ detected=f.bpm;document.getElementById('bpm').textContent=f.bpm?f.bpm.toFixed(1):'--';document.getElementById('lbpm').textContent=f.lamp_bpm?f.lamp_bpm.toFixed(1):'--';show();
  document.getElementById('nov').textContent=f.novelty.toFixed(2);
  const st=document.getElementById('state'),ch=f.novelty>f.threshold;
  st.textContent=ch?'CHANGE':'steady';st.style.background=ch?'#d4358c':'transparent';st.style.color=ch?'#fff':css('--dim');draw()};
@@ -597,36 +318,29 @@ function draw(){const W=c.width,H=c.height,t1=frames.length?frames[frames.length
  for(let i=1;i<4;i++){x.beginPath();x.moveTo(0,H*i/4);x.lineTo(W,H*i/4);x.stroke()}
  const X=t=>(t-t0)/SPAN*W,Y=(v,max)=>H-18-Math.min(v/max,1)*(H-40);
  const line=(key,max,color)=>{x.strokeStyle=color;x.lineWidth=3;x.beginPath();frames.forEach((f,i)=>{const px=X(f.t),py=Y(f[key],max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()};
- line('low',2.6,'#3b82f6');line('high',0.6,'#f59e0b');line('novelty',1,css('--fg'));
+ x.fillStyle='rgba(245,158,11,0.14)';frames.forEach(f=>{if(f.riser)x.fillRect(X(f.t),0,Math.max(3,W/SPAN*0.1),H)});
+ line('low',2.6,'#3b82f6');line('high',0.6,'#f59e0b');line('novelty',1,css('--fg'));line('level',1,'#22c55e');
  if(frames.length){x.strokeStyle='#d4358c';x.setLineDash([10,10]);x.lineWidth=2;const y=Y(frames[frames.length-1].threshold,1);x.beginPath();x.moveTo(0,y);x.lineTo(W,y);x.stroke();x.setLineDash([])}
  x.fillStyle=css('--dim');frames.forEach(f=>{if(f.kick)x.fillRect(X(f.t),H-12,3,12)});
+ x.fillStyle='#22c55e';frames.forEach(f=>{if(f.hit)x.fillRect(X(f.t),H-30,5,16)});
  marks.forEach(m=>{if(m.t<t0)return;x.strokeStyle='#d4358c';x.lineWidth=3;x.beginPath();x.moveTo(X(m.t),0);x.lineTo(X(m.t),H);x.stroke();x.fillStyle='#d4358c';x.font='28px system-ui';x.fillText(m.label,X(m.t)+8,34)})}
 </script>"""
 
 
 async def monitor(args):
-    """Serve a live browser view of the audio analysis: spectrum bands, novelty against the last 8 bars,
-    kicks and tempo. Keys in the page drop timestamped marks into lampster-marks.jsonl."""
+    """Serve a live browser view of what the lamp hears: spectrum bands, novelty against the last 8 bars, and the
+    same kicks, tempo, lamp beats and risers the lamp acts on (they come from the same Brain as `reactive`). Keys in
+    the page drop timestamped marks into lampster-marks.jsonl."""
     import numpy as np
 
     bpm_hint = float(args[0]) if args else PRIOR_BPM
     rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT", SYSTEM_AUDIO))
-    size, hop = 2048, 1024
-    window = np.hanning(size)
-    freqs = np.fft.rfftfreq(size, 1 / rate)
-    edges = np.geomspace(40, 12000, 11)
-    groups = [(freqs >= lo) & (freqs < hi) for lo, hi in zip(edges, edges[1:])]
-    bass_bins = (freqs >= BASS_HZ[0]) & (freqs <= BASS_HZ[1])
-    block_rate = rate / hop
-    ring = np.zeros(size, dtype=np.float32)
+    spectrum, brain = Spectrum(rate, bands=True), Brain(rate)
+    block_rate = rate / BLOCK
     heard, clients, pending_marks, state = deque(maxlen=int(block_rate * AUDIO_BACKLOG)), set(), [], {"tap": None}
-    history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
 
     def hear(indata, frames, time_info, status):
-        nonlocal ring
-        ring = np.concatenate([ring[frames:], indata[:, 0]])
-        spectrum = np.abs(np.fft.rfft(ring * window))
-        heard.append(([float(np.log1p(spectrum[g].mean())) for g in groups], float(np.sqrt(np.mean(spectrum[bass_bins] ** 2)))))
+        heard.append(spectrum(indata[:, 0]))
 
     async def serve(reader, writer):
         request = (await reader.readline()).decode().split()
@@ -656,34 +370,31 @@ async def monitor(args):
     webbrowser.open(url)
     short = long = None
     bar = 4 * 60 / bpm_hint
-    bass_avg, peak, last_kick, last_tempo, bpm = None, 0.0, 0.0, 0.0, None
-    t0 = time.monotonic()
-    with listen(hop, hear), open("lampster-marks.jsonl", "a") as marks_file:
+    seen = dict.fromkeys(("kick", "hit"), False)  # events since the last frame sent to the page
+    t0 = last_sent = time.monotonic()
+    with listen(BLOCK, hear), open("lampster-marks.jsonl", "a") as marks_file:
         while True:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1 / AUDIO_FPS)  # the lamp's own tick, so the Brain behaves exactly as it does on the lamp
             now = time.monotonic()
             blocks = [heard.popleft() for _ in range(len(heard))]
-            kick = False
-            for vector, bass in blocks:
-                v = np.array(vector)
+            lamp = brain.step([(f.bass, f.high) for f in blocks], now)
+            seen["kick"], seen["hit"] = seen["kick"] or lamp.kicked, seen["hit"] or lamp.hit
+            for f in blocks:
+                v = np.array(f.bands)
                 if short is None:
                     short, long = v.copy(), v.copy()
                 short += (v - short) / (bar * block_rate)
                 long += (v - long) / (8 * bar * block_rate)
-                history.append(bass)
-                peak = max(bass, peak * PEAK_DECAY)
-                bass_avg = bass if bass_avg is None else bass_avg + (bass - bass_avg) / 43
-                if bass > SILENCE and bass > BEAT_RATIO * bass_avg and bass > KICK_SHARE * peak and now - last_kick > MIN_BEAT_GAP:
-                    last_kick, kick = now, True
-            if short is None:
+            if short is None or now - last_sent < 0.1:
                 continue
-            if now - last_tempo > 1.0 and len(history) > block_rate * 4:
-                last_tempo, bpm = now, fold_tempo(history, block_rate)
-            bar = 4 * 60 / (state["tap"] or bpm or bpm_hint)  # a tapped tempo overrides the detector
+            last_sent = now
+            bar = 4 * 60 / (state["tap"] or brain.detected or bpm_hint)  # a tapped tempo overrides the detector
             label = pending_marks.pop(0) if pending_marks else None
             frame = {"t": now - t0, "novelty": float(np.abs(short - long).sum() / max(long.sum(), 1e-9)),
-                     "low": float(short[:3].mean()), "high": float(short[7:].mean()), "kick": kick, "bpm": bpm,
+                     "low": float(short[:3].mean()), "high": float(short[7:].mean()), "kick": seen["kick"], "hit": seen["hit"],
+                     "riser": lamp.riser, "level": round(lamp.level, 3), "bpm": brain.detected, "lamp_bpm": lamp.lamp_bpm,
                      "threshold": CHANGE_NOVELTY, "mark": label, "tap": state["tap"]}
+            seen["kick"] = seen["hit"] = False
             if label:
                 marks_file.write(json.dumps({"t": round(frame["t"], 2), "label": label, "novelty": round(frame["novelty"], 3)}) + "\n")
                 marks_file.flush()
@@ -694,6 +405,29 @@ async def monitor(args):
                     await client.drain()
                 except (ConnectionError, OSError):
                     clients.discard(client)
+
+
+def replay(args):
+    """Run a recording (LAMPSTER_RECORD=file lampster.py monitor) through the same analysis the lamp uses, with no lamp:
+    one line per second, then the summary `reactive` prints. An optional second argument is the tempo you tapped."""
+    import numpy as np
+
+    if not args:
+        sys.exit("usage: lampster.py replay RECORDING [TAPPED_BPM]")
+    rate = json.load(open(args[0] + ".json"))["rate"] if os.path.exists(args[0] + ".json") else 48000
+    samples = np.fromfile(args[0], dtype=np.float32)
+    kicks = hits = 0
+    last, frames = None, 0
+    for t, frame in simulate(samples, rate, rng=random.Random(0)):
+        kicks, hits, frames, last = kicks + frame.kicked, hits + frame.hit, frames + 1, frame
+        if frames % AUDIO_FPS == 0:
+            tempo = f"{frame.lamp_bpm:6.1f}" if frame.lamp_bpm else "   -  "
+            raw = f"{frame.bpm:6.1f}" if frame.bpm else "   -  "
+            print(f"{t:6.1f}s  lamp {tempo} BPM  detector {raw}  kicks {kicks:4d}  lamp beats {hits:4d}  "
+                  f"{'RISER' if frame.riser else '     '}  level {frame.level:.2f}")
+    if last and last.lamp_bpm:
+        extra = f"; you tapped {float(args[1]):.1f}, off by {100 * (last.lamp_bpm / float(args[1]) - 1):+.1f}%" if len(args) > 1 else ""
+        print(f"{kicks} kicks, {hits} lamp beats in {len(samples) / rate:.0f}s, final lamp tempo {last.lamp_bpm:.1f} BPM{extra}")
 
 
 async def run(c, argv):
@@ -723,7 +457,7 @@ async def main(argv):
         return print(f"lampster-ctl {VERSION}")
     if not argv:
         argv = ["reactive"]  # the default: follow the music the Mac is playing
-    if argv[0] not in ("status", "color", "white", "mode", "fade", "hue", "sun", "disco", "reactive", "monitor"):
+    if argv[0] not in ("status", "color", "white", "mode", "fade", "hue", "sun", "disco", "reactive", "monitor", "replay"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
@@ -731,6 +465,8 @@ async def main(argv):
         sys.exit("sun needs LAMPSTER_LAT and LAMPSTER_LON in the environment (degrees, east positive)")
     if argv[0] == "monitor":
         return await monitor(argv[1:])
+    if argv[0] == "replay":
+        return replay(argv[1:])
     long_running, drops = argv[0] in ("hue", "sun", "disco", "reactive"), 0
     while True:
         lamp = await BleakScanner.find_device_by_name(NAME, timeout=15)
