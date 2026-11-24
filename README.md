@@ -34,10 +34,10 @@ LAMPSTER_LAT=48.86 LAMPSTER_LON=2.35 ./lampster.py sun
 
 ## Reactive mode
 
-`./lampster.py reactive [SECONDS]` listens to an audio input and flashes a new colour on every bass beat, then lets the light decay until the next one. It uses the system's default input (the microphone), so it works for any room with music in it. For a clean digital signal with nothing to reroute, tap what the Mac is playing (macOS 14.2+, needs Xcode's command line tools for `swiftc`):
+`./lampster.py reactive [SECONDS]` flashes a new colour on every bass beat, then lets the light decay until the next one. It is the default: `./lampster.py` with no command runs it. By default it taps what the Mac is playing, a clean digital signal with nothing to reroute (macOS 14.2+, needs Xcode's command line tools for `swiftc`). To listen to a room with a microphone instead, name the input device:
 
 ```bash
-LAMPSTER_AUDIO_INPUT=system ./lampster.py reactive
+LAMPSTER_AUDIO_INPUT=MacBook ./lampster.py reactive   # any part of an input device's name
 ```
 
 `systap.swift` is a small Core Audio process tap that writes the system output as mono samples; `lampster.py` compiles it once into `~/.cache/lampster-ctl/` and the microphone stays free for dictation. Your output device and volume are untouched, and the first run may ask the terminal for system audio permission. `monitor` accepts it too. The older route also works: send the output to a loopback device such as [BlackHole](https://existential.audio/blackhole/) through a Multi-Output Device in Audio MIDI Setup, and name it with `LAMPSTER_AUDIO_INPUT=BlackHole`.

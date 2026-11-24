@@ -5,6 +5,7 @@
 # ///
 """Control The Lampster over Bluetooth LE.
 
+  lampster.py                  # no command = reactive: follow the music the Mac is playing
   lampster.py version          # print the version (also --version)
   lampster.py status
   lampster.py color R G B     # 0-255 each, or a single #rrggbb
@@ -12,7 +13,7 @@
   lampster.py mode off|white|color|both   # which LED banks are lit
   lampster.py fade SECONDS R G B|#rrggbb  # crossfade whatever is lit into that color
   lampster.py reactive [SECONDS]          # pulse to the bass heard on the audio input, whites on risers
-                                          # LAMPSTER_AUDIO_INPUT=name part of an input device, or "system" for what the Mac plays
+                                          # LAMPSTER_AUDIO_INPUT=name part of an input device; the default is "system", what the Mac plays
   lampster.py monitor [BPM]               # live browser view of the audio analysis, with keys to mark what you hear
   lampster.py disco [BPM [SECONDS]]       # a new colour every beat, an occasional 3 Hz strobe burst
   lampster.py hue [PERIOD [SECONDS]]      # rotate the hue of the lit color through 360 degrees every PERIOD seconds
@@ -37,7 +38,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -309,7 +310,7 @@ async def reactive(c, args):
     import numpy as np
 
     seconds = float(args[0]) if args else None
-    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT"))
+    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT", SYSTEM_AUDIO))
     size = 2048
     window = np.hanning(size)
     bins = {name: slice(*(int(hz * size / rate) for hz in span)) for name, span in (("bass", BASS_HZ), ("high", HIGH_HZ))}
@@ -496,7 +497,7 @@ async def monitor(args):
     import numpy as np
 
     bpm_hint = float(args[0]) if args else PRIOR_BPM
-    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT"))
+    rate, listen = open_audio(os.environ.get("LAMPSTER_AUDIO_INPUT", SYSTEM_AUDIO))
     size, hop = 2048, 1024
     window = np.hanning(size)
     freqs = np.fft.rfftfreq(size, 1 / rate)
@@ -607,7 +608,9 @@ async def run(c, argv):
 async def main(argv):
     if argv in (["version"], ["--version"]):
         return print(f"lampster-ctl {VERSION}")
-    if not argv or argv[0] not in ("status", "color", "white", "mode", "fade", "hue", "sun", "disco", "reactive", "monitor"):
+    if not argv:
+        argv = ["reactive"]  # the default: follow the music the Mac is playing
+    if argv[0] not in ("status", "color", "white", "mode", "fade", "hue", "sun", "disco", "reactive", "monitor"):
         sys.exit(__doc__)
     if argv[0] == "mode" and argv[1:] not in ([m] for m in MODES):
         sys.exit(__doc__)
