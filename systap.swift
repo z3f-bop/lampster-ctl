@@ -1,5 +1,7 @@
 // Tap everything the Mac plays, mix to mono, write float32 samples to stdout.
-// stderr gets one line, "rate=<hz>", once the tap is live. Usage: systap [seconds]
+// stderr gets one line, "rate=<hz> ...", once the tap is live, then "drops=<n>" lines if the reader falls behind.
+// The tap cleans up and exits on SIGTERM, SIGINT, a closed stdin (the parent is gone, even if it was killed) or a
+// closed stdout, so keep stdin open. Usage: systap [seconds]
 import CoreAudio
 import Foundation
 
@@ -45,8 +47,30 @@ if status != noErr { fail("create aggregate device", status) }
 let channels = Int(format.mChannelsPerFrame)
 let interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
 let out = FileHandle.standardOutput
-
 var procID: AudioDeviceIOProcID?
+var shuttingDown = false
+var drops = 0
+var reportedDrops = 0
+
+// Always runs on the main queue. Stops the device first so no callback is in flight while the tap is destroyed.
+func shutdown() -> Never {
+    if !shuttingDown {
+        shuttingDown = true
+        AudioDeviceStop(aggregateID, procID)
+        if let procID { AudioDeviceDestroyIOProcID(aggregateID, procID) }
+        AudioHardwareDestroyAggregateDevice(aggregateID)
+        AudioHardwareDestroyProcessTap(tapID)
+    }
+    exit(0)
+}
+
+func requestShutdown() { DispatchQueue.main.async { shutdown() } }
+
+// The audio thread never blocks on the pipe: blocks go to a writer queue, and when the reader is more than about
+// 1.4 s behind they are dropped and counted, so a stalled parent cannot wedge the device.
+let writer = DispatchQueue(label: "systap.writer")
+let slots = DispatchSemaphore(value: 64)
+
 status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, nil) { _, inData, _, _, _ in
     let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
     guard let first = buffers.first, let base = first.mData else { return }
@@ -66,25 +90,49 @@ status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, nil) { _, inDa
             for f in 0..<frames { mono[f] += samples[f] / Float(buffers.count) }
         }
     }
-    mono.withUnsafeBufferPointer { out.write(Data(buffer: $0)) }
+    let data = mono.withUnsafeBufferPointer { Data(buffer: $0) }
+    if slots.wait(timeout: .now()) == .success {
+        writer.async {
+            do { try out.write(contentsOf: data) } catch { requestShutdown() }
+            slots.signal()
+        }
+    } else {
+        drops += 1
+    }
 }
 if status != noErr { fail("create IO proc", status) }
+
+var sources: [DispatchSourceProtocol] = []
+for sig in [SIGTERM, SIGINT] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { shutdown() }
+    source.resume()
+    sources.append(source)
+}
+
+// The parent never writes to stdin: end of file means it is gone.
+Thread.detachNewThread {
+    while !FileHandle.standardInput.availableData.isEmpty {}
+    requestShutdown()
+}
+
+let report = DispatchSource.makeTimerSource(queue: .main)
+report.schedule(deadline: .now() + 10, repeating: 10)
+report.setEventHandler {
+    if drops != reportedDrops {
+        reportedDrops = drops
+        FileHandle.standardError.write("drops=\(drops)\n".data(using: .utf8)!)
+    }
+}
+report.resume()
+sources.append(report)
 
 status = AudioDeviceStart(aggregateID, procID)
 if status != noErr { fail("start device", status) }
 
 FileHandle.standardError.write("rate=\(Int(format.mSampleRate)) channels=\(channels) interleaved=\(interleaved)\n".data(using: .utf8)!)
 
-func shutdown() -> Never {
-    AudioDeviceStop(aggregateID, procID)
-    if let procID { AudioDeviceDestroyIOProcID(aggregateID, procID) }
-    AudioHardwareDestroyAggregateDevice(aggregateID)
-    AudioHardwareDestroyProcessTap(tapID)
-    exit(0)
-}
-
-signal(SIGTERM) { _ in exit(0) }
-signal(SIGINT) { _ in exit(0) }
 if let seconds {
     DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { shutdown() }
 }

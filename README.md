@@ -44,6 +44,15 @@ LAMPSTER_AUDIO_INPUT=MacBook ./lampster.py reactive   # any part of an input dev
 
 The beat detector looks at 30-150 Hz energy against its own running average (`BASS_HZ`, `BEAT_RATIO`, `SILENCE` at the top of the script). A kick must reach a share of the track's own recent peak, so the system volume does not matter. When the kick drops out and the highs start climbing (a riser), the whites swell and pulse, capped at 3 flashes per second, then a single full flash lands when the kick returns. The lamp's beat is not every kick: the tempo is estimated from the bass (autocorrelation over the last 10 seconds) and folded into a dance range (`DANCE_BPM`, 82-165), the way people hear it. Music that reads faster is danced at half speed, so extra kicks are skipped; music that reads slower is danced at double speed, so beats are added in between. Every `WHITE_EVERY`-th beat (default 4, one bar) is white and the rest are new colours, each a spike that decays at `DECAY` per update. When the music stops, the lamp fades to 5% over 5 seconds. Laptop speakers have little bass, so with a microphone you may need to lower `SILENCE`. The terminal needs microphone permission the first time. Like disco, it needs `uv` to fetch `numpy` and `sounddevice`. `LAMPSTER_BRIGHTNESS` (5 to 100, default 100) scales every light level of `reactive` and `disco`, the strobes and risers included; about 30 suits a dark room.
 
+### Reliability of the system tap
+
+- One tap serves the whole run: a lamp reconnect re-enters the analysis but reuses it, so a second tap is never opened.
+- A supervisor restarts `systap` when it exits or delivers nothing for 3 seconds (a stuck one is killed), pausing 0.5 s, 1 s, 2 s... up to 30 s while restarts keep failing, and logs each restart to stderr. If the output device changes sample rate, blocks are resampled to the rate the analysis started with.
+- `systap` cleans up and exits by itself on SIGTERM, SIGINT, or end of file on stdin (its parent is gone, even if killed). Its audio thread never blocks on the pipe: after about 1.4 s of backlog blocks are dropped and counted (`drops=N` on stderr).
+- The analysis keeps at most `AUDIO_BACKLOG` seconds of blocks if the lamp loop stalls.
+- A plain `kill` (SIGTERM) ends a run like Ctrl-C, and the lamp is left dark instead of on its last colour.
+- Tests need no lamp and no audio hardware, only a fake tap process: `uv run --with pytest --with numpy --with bleak --with sounddevice pytest tests`. `LAMPSTER_TAP_BINARY` points the script at another tap binary, so a test build never replaces the one a live run is executing.
+
 ## Monitor
 
 `./lampster.py monitor [BPM]` opens a live page at `http://localhost:8787` (set `LAMPSTER_MONITOR_PORT` if another service holds that port; it never touches the lamp) showing the audio analysis as the track plays: low and high band levels, kicks, the folded tempo, and **novelty**, how far the last bar's spectrum is from the average of the last 8 bars. Steady four-on-the-floor sits near 0.05; a breakdown, a new element or a build lifts it above 0.2, which is where the page shows CHANGE.

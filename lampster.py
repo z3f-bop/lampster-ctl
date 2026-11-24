@@ -22,11 +22,15 @@
                                           # needs LAMPSTER_LAT and LAMPSTER_LON (degrees, east positive)
 """
 import asyncio
+import atexit
 import colorsys
+import contextlib
 import json
 import math
 import os
 import random
+import select
+import signal
 import subprocess
 import sys
 import threading
@@ -38,7 +42,7 @@ from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError, BleakGATTProtocolError
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 NAME = "Lampster"
 BASE = "-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 MODE, WHITE, COLOR = (f"01ff{h}{BASE}" for h in ("5554", "5556", "5559"))
@@ -50,6 +54,7 @@ LAT, LON = (float(os.environ.get(k, "nan")) for k in ("LAMPSTER_LAT", "LAMPSTER_
 STROBE_HZ = 3  # flashes per second, at the photosensitivity guideline limit; never raise this
 STROBE_CHANCE = 0.3  # per 8-beat phrase
 AUDIO_FPS = 40  # lamp updates per second in reactive mode
+AUDIO_BACKLOG = 5  # seconds of analysed audio kept if the lamp loop stalls; older blocks are dropped
 BASS_HZ = (30, 150)  # band whose energy marks a beat
 BEAT_RATIO = 1.4  # a beat is bass this many times above its running average
 MIN_BEAT_GAP = 0.15  # seconds between raw kick detections
@@ -244,59 +249,167 @@ def fold_tempo(energies, block_rate):
 
 SYSTEM_AUDIO = "system"  # LAMPSTER_AUDIO_INPUT value that taps the Mac's own output instead of an input device
 TAP_SOURCE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "systap.swift")
-TAP_BINARY = os.path.expanduser("~/.cache/lampster-ctl/systap")
+TAP_BINARY = os.environ.get("LAMPSTER_TAP_BINARY") or os.path.expanduser("~/.cache/lampster-ctl/systap")
+
+
+def log(message):
+    print(f"lampster: {message}", file=sys.stderr, flush=True)
 
 
 class SystemTap:
     """What the Mac is playing, tapped by systap.swift (Core Audio process tap, macOS 14.2+), with the same
-    `with` and callback shape as sd.InputStream so the analysis does not care where its samples come from."""
+    `with` and callback shape as sd.InputStream so the analysis does not care where its samples come from.
 
-    def __init__(self):
+    One tap serves the whole process: a lamp reconnect re-enters the analysis but reuses this object, so a second
+    tap is never opened. A supervisor thread restarts the child when it exits or stops delivering audio, pausing
+    longer after each quick failure, and the child exits by itself when this process is gone."""
+
+    STALL = 3.0  # seconds without a byte before the tap counts as stuck
+    PAUSES = (0.5, 1, 2, 5, 10, 30)  # seconds before the next restart, growing while restarts keep failing
+    HEALTHY = 10.0  # a tap that ran this long starts the pauses over
+
+    def __init__(self, binary=None):
         import numpy as np
 
-        self.np = np
-        if not os.path.exists(TAP_BINARY) or os.path.getmtime(TAP_BINARY) < os.path.getmtime(TAP_SOURCE):
+        self.np, self.binary = np, binary or TAP_BINARY
+        self.callback = self.pending = self.proc = self.thread = None
+        self.blocksize, self.restarts, self.closed = 1024, 0, threading.Event()
+        if binary is None and (not os.path.exists(TAP_BINARY) or os.path.getmtime(TAP_BINARY) < os.path.getmtime(TAP_SOURCE)):
             os.makedirs(os.path.dirname(TAP_BINARY), exist_ok=True)
             subprocess.run(["swiftc", "-swift-version", "5", "-O", TAP_SOURCE, "-o", TAP_BINARY], check=True)
-        self.proc = subprocess.Popen([TAP_BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        line = self.proc.stderr.readline().decode()
+        try:
+            self.rate = self.source_rate = self.spawn()
+        except RuntimeError as error:
+            sys.exit(str(error))
+        atexit.register(self.close)
+
+    def spawn(self):
+        """Start the child and return its sample rate. stdin stays open: its end of file is the child's cue to exit."""
+        proc = subprocess.Popen([self.binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        line = proc.stderr.readline().decode() if select.select([proc.stderr], [], [], 15)[0] else ""
         if not line.startswith("rate="):
-            self.proc.kill()
-            sys.exit(f"system audio tap failed: {(line + self.proc.stderr.read().decode()).strip()}")
-        self.rate = float(line.split()[0].removeprefix("rate="))
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"system audio tap failed: {(line + proc.stderr.read().decode()).strip()}")
+        self.proc = proc
+        threading.Thread(target=self.relay, args=(proc,), daemon=True).start()
+        return float(line.split()[0].removeprefix("rate="))
+
+    def relay(self, proc):
+        for line in proc.stderr:
+            log(f"tap: {line.decode().strip()}")
 
     def stream(self, blocksize, callback):
-        self.blocksize, self.callback = blocksize, callback
+        self.pending = (blocksize, callback)
         return self
 
     def __enter__(self):
-        threading.Thread(target=self.pump, daemon=True).start()
+        self.blocksize, self.callback = self.pending
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.supervise, daemon=True)
+            self.thread.start()
         return self
 
     def __exit__(self, *exc):
-        self.proc.terminate()
-        self.proc.wait()
+        self.callback = None  # the tap keeps running for the next analysis
 
-    def pump(self):
-        while True:
-            data = self.proc.stdout.read(self.blocksize * 4)  # float32 mono
-            if len(data) < self.blocksize * 4:
+    def close(self):
+        self.closed.set()
+        self.stop(self.proc)
+
+    @staticmethod
+    def stop(proc):
+        if proc is None:
+            return
+        with contextlib.suppress(OSError):
+            proc.stdin.close()  # end of file on stdin makes the child clean up and exit
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    def supervise(self):
+        failures = 0
+        while not self.closed.is_set():
+            started = time.monotonic()
+            reason = self.pump(self.proc)
+            if self.closed.is_set():
                 return
-            block = self.np.frombuffer(data, dtype=self.np.float32).reshape(-1, 1)
-            self.callback(block, self.blocksize, None, None)
+            self.stop(self.proc)
+            failures = 0 if time.monotonic() - started >= self.HEALTHY else failures + 1
+            self.restarts += 1
+            log(f"audio tap {reason} after {time.monotonic() - started:.0f}s, restart {self.restarts}")
+            while not self.closed.wait(self.PAUSES[min(failures, len(self.PAUSES) - 1)]):
+                try:
+                    self.source_rate = self.spawn()
+                    break
+                except RuntimeError as error:
+                    failures += 1
+                    log(str(error))
+
+    def need(self):
+        """Bytes of float32 mono that make one block, at the child's rate."""
+        return round(self.blocksize * self.source_rate / self.rate) * 4
+
+    def pump(self, proc):
+        """Deliver blocks until the child exits or goes quiet; returns why."""
+        fd, buf, last = proc.stdout.fileno(), bytearray(), time.monotonic()
+        while not self.closed.is_set():
+            if select.select([fd], [], [], 0.5)[0]:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return "exited"
+                buf += chunk
+                last = time.monotonic()
+                while len(buf) >= self.need():
+                    size = self.need()
+                    self.deliver(bytes(buf[:size]))
+                    del buf[:size]
+            elif proc.poll() is not None:
+                return "exited"
+            elif time.monotonic() - last > self.STALL:
+                return "stalled"
+        return "closed"
+
+    def deliver(self, data):
+        callback = self.callback
+        if callback is None:
+            return
+        block = self.np.frombuffer(data, dtype=self.np.float32)
+        if self.source_rate != self.rate:  # the output device changed rate: resample to the rate the analysis was built for
+            block = self.np.interp(self.np.linspace(0, len(block) - 1, self.blocksize), self.np.arange(len(block)), block).astype(self.np.float32)
+        try:
+            callback(block.reshape(-1, 1), self.blocksize, None, None)
+        except Exception as error:  # a bad block must not end the audio
+            log(f"analysis callback failed: {error!r}")
+
+
+class DeviceAudio:
+    """An input device (the microphone, BlackHole), through sounddevice."""
+
+    def __init__(self, device):
+        import sounddevice as sd
+
+        self.sd, self.device = sd, device
+        self.rate = sd.query_devices(device, "input")["default_samplerate"]
+
+    def stream(self, blocksize, callback):
+        return self.sd.InputStream(device=self.device, channels=1, samplerate=self.rate, blocksize=blocksize, callback=callback)
+
+
+_system_tap = None
 
 
 def open_audio(device):
     """(sample rate, stream factory taking blocksize and callback) for LAMPSTER_AUDIO_INPUT."""
+    global _system_tap
     if device == SYSTEM_AUDIO:
-        tap = SystemTap()
-        return tap.rate, tap.stream
-    import sounddevice as sd
-
-    rate = sd.query_devices(device, "input")["default_samplerate"]
-    return rate, lambda blocksize, callback: sd.InputStream(
-        device=device, channels=1, samplerate=rate, blocksize=blocksize, callback=callback
-    )
+        if _system_tap is None or _system_tap.closed.is_set():
+            _system_tap = SystemTap()
+        return _system_tap.rate, _system_tap.stream
+    audio = DeviceAudio(device)
+    return audio.rate, audio.stream
 
 
 def dimmed(levels):
@@ -315,7 +428,7 @@ async def reactive(c, args):
     window = np.hanning(size)
     bins = {name: slice(*(int(hz * size / rate) for hz in span)) for name, span in (("bass", BASS_HZ), ("high", HIGH_HZ))}
     ring = np.zeros(size, dtype=np.float32)
-    heard = []
+    heard = deque(maxlen=int(rate / 1024 * AUDIO_BACKLOG))  # if the lamp stalls, the oldest blocks fall off
 
     def hear(indata, frames, time_info, status):
         nonlocal ring
@@ -346,7 +459,7 @@ async def reactive(c, args):
     t0 = time.monotonic()
     with listen(1024, hear):
         while seconds is None or time.monotonic() - t0 < seconds:
-            blocks, heard[:] = heard[:], []
+            blocks = [heard.popleft() for _ in range(len(heard))]
             now = time.monotonic()
             for bass, high in blocks:
                 peak = max(bass, peak * PEAK_DECAY)  # follows the track's own loudness, so volume does not matter
@@ -506,7 +619,7 @@ async def monitor(args):
     bass_bins = (freqs >= BASS_HZ[0]) & (freqs <= BASS_HZ[1])
     block_rate = rate / hop
     ring = np.zeros(size, dtype=np.float32)
-    heard, clients, pending_marks, state = [], set(), [], {"tap": None}
+    heard, clients, pending_marks, state = deque(maxlen=int(block_rate * AUDIO_BACKLOG)), set(), [], {"tap": None}
     history = deque(maxlen=int(block_rate * TEMPO_WINDOW))
 
     def hear(indata, frames, time_info, status):
@@ -549,7 +662,7 @@ async def monitor(args):
         while True:
             await asyncio.sleep(0.1)
             now = time.monotonic()
-            blocks, heard[:] = heard[:], []
+            blocks = [heard.popleft() for _ in range(len(heard))]
             kick = False
             for vector, bass in blocks:
                 v = np.array(vector)
@@ -626,7 +739,14 @@ async def main(argv):
         if lamp:
             try:
                 async with BleakClient(lamp, timeout=20) as c:
-                    return await run(c, argv)
+                    try:
+                        return await run(c, argv)
+                    except asyncio.CancelledError:  # stopped from outside: leave the lamp dark, not on its last colour
+                        if long_running and c.is_connected:
+                            with contextlib.suppress(Exception):
+                                await c.write_gatt_char(COLOR, bytes(3), response=False)
+                                await c.write_gatt_char(WHITE, bytes(2), response=True)
+                        raise
             except (BleakError, asyncio.TimeoutError) as error:
                 if not long_running:
                     raise
@@ -635,4 +755,6 @@ async def main(argv):
         await asyncio.sleep(2)  # a long-running mode keeps trying until stopped
 
 
-asyncio.run(main(sys.argv[1:]))
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal.default_int_handler)  # a plain kill ends a run like Ctrl-C, so the lamp is released cleanly
+    asyncio.run(main(sys.argv[1:]))
